@@ -1,0 +1,170 @@
+<svg xmlns="http://www.w3.org/2000/svg" id="arch" data-flow="p" viewBox="0 0 1000 545" width="1000" height="545">
+<style>
+#arch {
+  --bg: #f4f5f8; --surface: #ffffff; --fg: #1b1f27; --muted: #5b6374; --line: #d7dbe4; --band: #eceef3;
+  --accent: #2f5bd3;
+  --ft: #2f5bd3; --fm: #0d7f70; --fp: #7a3fc4; --fw: #c2530c; --fo: #5b6374;
+  --display: "Space Grotesk", system-ui, sans-serif;
+  --body: "Inter", system-ui, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, monospace;
+ --display: "Space Grotesk", system-ui, -apple-system, "Segoe UI", sans-serif; --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace; --sel: transparent;}
+@media (prefers-color-scheme: dark) { #arch {
+  --bg: #12151b; --surface: #1a1e26; --fg: #e6e9ef; --muted: #9aa3b4; --line: #2e3440; --band: #161a21;
+  --accent: #8aa6ff;
+  --ft: #8aa6ff; --fm: #4fd1bd; --fp: #c39bff; --fw: #ff9f60; --fo: #b7bfcc; color-scheme: dark } }
+#arch .bg { fill: var(--surface); stroke: var(--line); }
+
+#arch .box rect { fill: var(--surface); stroke: var(--line); stroke-width: 1.5; }
+#arch .t1 { fill: var(--fg); font: 700 15px var(--display); }
+#arch .t1s { fill: var(--fg); font: 700 13px var(--display); }
+#arch .t2 { fill: var(--muted); font: 11px var(--mono); }
+#arch .box[data-k] { cursor: pointer; }
+#arch .box[data-k]:focus { outline: none; }
+#arch .box[data-k]:hover rect, #arch .box.sel rect { fill: var(--sel); }
+#arch .box[data-k]:focus-visible rect { stroke: var(--accent); stroke-width: 3; }
+#arch .dep { fill: none; stroke: var(--fg); stroke-width: 1.6; opacity: .8; marker-end: url(#ah-d); }
+#arch .use { fill: none; stroke: var(--muted); stroke-width: 1.3; stroke-dasharray: 4 4; marker-end: url(#ah-u); }
+#arch .ah-d { fill: var(--fg); } #arch .ah-u { fill: var(--muted); }
+#arch .dl, #arch .ul { font: 600 11px var(--mono); paint-order: stroke; stroke: var(--surface); stroke-width: 4px; stroke-linejoin: round; }
+#arch .dl { fill: var(--fg); } #arch .ul { fill: var(--muted); font-weight: 500; }
+
+#arch .band { fill: var(--band); }
+#arch .bl { fill: var(--muted); font: 600 11px var(--body); letter-spacing: .08em; }
+#arch .box rect { fill: var(--surface); stroke: var(--line); stroke-width: 1.5; transition: stroke .2s; }
+#arch .t1 { fill: var(--fg); font: 700 15px var(--display); }
+#arch .t1s { fill: var(--fg); font: 700 13px var(--display); }
+#arch .t2 { fill: var(--muted); font: 11px var(--mono); }
+#arch .e { fill: none; stroke: var(--line); stroke-width: 2; opacity: .55; }
+#arch .s { fill: none; stroke: var(--muted); stroke-width: 1.5; opacity: .7; }
+#arch .sl { fill: var(--muted); font: 11px var(--mono); }
+#arch .ah-s { fill: var(--muted); }
+#arch .ah-t { fill: var(--ft); } #arch .ah-m { fill: var(--fm); } #arch .ah-p { fill: var(--fp); }
+#arch .ah-w { fill: var(--fw); } #arch .ah-o { fill: var(--fo); }
+#arch .el { display: none; font: 600 11px var(--mono); paint-order: stroke; stroke: var(--surface); stroke-width: 4px; stroke-linejoin: round; }
+#arch[data-flow="t"] .e.t { stroke: var(--ft); marker-end: url(#ah-t); }
+#arch[data-flow="m"] .e.m { stroke: var(--fm); marker-end: url(#ah-m); }
+#arch[data-flow="p"] .e.p { stroke: var(--fp); marker-end: url(#ah-p); }
+#arch[data-flow="w"] .e.w { stroke: var(--fw); marker-end: url(#ah-w); }
+#arch[data-flow="o"] .e.o { stroke: var(--fo); marker-end: url(#ah-o); }
+#arch[data-flow="t"] .e.t, #arch[data-flow="m"] .e.m, #arch[data-flow="p"] .e.p,
+#arch[data-flow="w"] .e.w, #arch[data-flow="o"] .e.o {
+  opacity: 1; stroke-width: 2.5; stroke-dasharray: 7 5; animation: dash .9s linear infinite; }
+#arch[data-flow="t"] .el.t { display: inline; fill: var(--ft); }
+#arch[data-flow="m"] .el.m { display: inline; fill: var(--fm); }
+#arch[data-flow="p"] .el.p { display: inline; fill: var(--fp); }
+#arch[data-flow="w"] .el.w { display: inline; fill: var(--fw); }
+#arch[data-flow="o"] .el.o { display: inline; fill: var(--fo); }
+#arch[data-flow="t"] .box.t rect { stroke: var(--ft); stroke-width: 2.5; }
+#arch[data-flow="m"] .box.m rect { stroke: var(--fm); stroke-width: 2.5; }
+#arch[data-flow="p"] .box.p rect { stroke: var(--fp); stroke-width: 2.5; }
+#arch[data-flow="w"] .box.w rect { stroke: var(--fw); stroke-width: 2.5; }
+#arch[data-flow="o"] .box.o rect { stroke: var(--fo); stroke-width: 2.5; }
+@keyframes dash { to { stroke-dashoffset: -12; } }
+#arch .box[data-k] { cursor: pointer; }
+#arch .box[data-k]:focus { outline: none; }
+#arch .box[data-k]:hover rect, #arch .box.sel rect { fill: var(--sel); }
+#arch .box[data-k]:focus-visible rect { stroke: var(--accent); stroke-width: 3; }
+</style>
+<rect class="bg" x="0.5" y="0.5" width="999" height="544" rx="10"/>
+        <defs>
+          <marker id="ah-s" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="9" markerHeight="9" orient="auto-start-reverse"><path class="ah-s" d="M0 0L10 5L0 10z"/></marker>
+          <marker id="ah-t" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path class="ah-t" d="M0 0L10 5L0 10z"/></marker>
+          <marker id="ah-m" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path class="ah-m" d="M0 0L10 5L0 10z"/></marker>
+          <marker id="ah-p" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path class="ah-p" d="M0 0L10 5L0 10z"/></marker>
+          <marker id="ah-w" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path class="ah-w" d="M0 0L10 5L0 10z"/></marker>
+          <marker id="ah-o" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path class="ah-o" d="M0 0L10 5L0 10z"/></marker>
+        </defs>
+
+        <!-- bands -->
+        <rect class="band" x="10" y="14" width="980" height="94" rx="8"/>
+        <text class="bl" x="40" y="31">SDK</text>
+        <rect class="band" x="10" y="122" width="980" height="94" rx="8"/>
+        <text class="bl" x="40" y="139">API · PUBLIC</text>
+        <rect class="band" x="10" y="228" width="980" height="102" rx="8"/>
+        <text class="bl" x="40" y="246">READER · WRITER · INTERNAL</text>
+        <rect class="band" x="10" y="342" width="980" height="80" rx="8"/>
+        <text class="bl" x="40" y="359">CONNECTION · INTERNAL</text>
+        <rect class="band" x="10" y="436" width="980" height="96" rx="8"/>
+        <text class="bl" x="40" y="453">SERVER · GIVEN</text>
+
+        <!-- static links -->
+        <path class="s" d="M260 98 V122" marker-end="url(#ah-s)"/>
+        <text class="sl" x="268" y="114">binding</text>
+        <path class="s" d="M740 98 V122" marker-end="url(#ah-s)"/>
+        <path class="s" d="M500 414 V464" marker-start="url(#ah-s)" marker-end="url(#ah-s)"/>
+        <text class="sl" x="508" y="446">Arrow Flight · one connection</text>
+
+        <!-- flow edges -->
+        <path class="e t" d="M250 206 V366"/>
+        <path class="e t" d="M340 206 V256"/>
+        <path class="e t m p" d="M340 318 V366"/>
+        <path class="e t" d="M400 258 V208"/>
+        <path class="e m" d="M455 206 V366"/>
+        <path class="e m" d="M545 206 V256"/>
+        <path class="e m p" d="M470 278 H422"/>
+        <path class="e m p" d="M420 300 H468"/>
+        <path class="e m" d="M600 258 V208"/>
+        <path class="e p" d="M380 206 V240 H490 V256"/>
+        <path class="e p" d="M600 258 V224 H412 V208"/>
+        <path class="e w" d="M720 206 V256"/>
+        <path class="e w" d="M804 177 H818"/>
+        <path class="e w" d="M760 318 V366"/>
+        <path class="e w" d="M900 206 V256"/>
+        <path class="e w" d="M900 318 V366"/>
+        <path class="e w" d="M820 288 H838"/>
+        <path class="e o" d="M180 206 V366"/>
+
+        <!-- boxes -->
+        <g class="box" data-k="py" tabindex="0" role="button" aria-label="Python SDK"><rect x="40" y="40" width="440" height="58" rx="8"/>
+          <text class="t1" x="56" y="64">Python SDK</text>
+          <text class="t2" x="56" y="84">generated ontologies and views · exceptions · pandas · ml</text></g>
+        <g class="box" data-k="rs" tabindex="0" role="button" aria-label="Rust SDK"><rect x="520" y="40" width="440" height="58" rx="8"/>
+          <text class="t1" x="536" y="64">Rust SDK</text>
+          <text class="t2" x="536" y="84">async + blocking API · Result · generated ontologies</text></g>
+
+        <g class="box o" data-k="client" tabindex="0" role="button" aria-label="MosaicoClient"><rect x="40" y="148" width="160" height="58" rx="8"/>
+          <text class="t1" x="52" y="172">MosaicoClient</text><text class="t2" x="52" y="192">connect · query</text></g>
+        <g class="box t p" data-k="topic" tabindex="0" role="button" aria-label="TopicHandler"><rect x="220" y="148" width="200" height="58" rx="8"/>
+          <text class="t1" x="232" y="172">TopicHandler</text><text class="t2" x="232" y="192">streamers · to_arrow</text></g>
+        <g class="box m" data-k="seq" tabindex="0" role="button" aria-label="SequenceHandler"><rect x="440" y="148" width="180" height="58" rx="8"/>
+          <text class="t1" x="452" y="172">SequenceHandler</text><text class="t2" x="452" y="192">multi-topic merge</text></g>
+        <g class="box w" data-k="writer" tabindex="0" role="button" aria-label="SequenceWriter and SequenceUpdater"><rect x="636" y="148" width="168" height="58" rx="8"/>
+          <text class="t1s" x="648" y="165">SequenceWriter</text><text class="t1s" x="648" y="181">SequenceUpdater</text><text class="t2" x="648" y="198">topic_create · finish</text></g>
+        <g class="box w" data-k="twriter" tabindex="0" role="button" aria-label="TopicWriter"><rect x="820" y="148" width="140" height="58" rx="8"/>
+          <text class="t1" x="832" y="172">TopicWriter</text><text class="t2" x="832" y="192">push · push_batch</text></g>
+
+        <g class="box t m p" data-k="stream" tabindex="0" role="button" aria-label="BatchReader"><rect x="260" y="258" width="160" height="60" rx="8"/>
+          <text class="t1" x="272" y="282">BatchReader</text><text class="t2" x="272" y="302">background decode</text></g>
+        <g class="box m p" data-k="multi" tabindex="0" role="button" aria-label="MultiReader"><rect x="470" y="258" width="150" height="60" rx="8"/>
+          <text class="t1" x="482" y="282">MultiReader</text><text class="t2" x="482" y="302">merge · concat</text></g>
+        <g class="box w" data-k="session" tabindex="0" role="button" aria-label="Session"><rect x="700" y="258" width="120" height="60" rx="8"/>
+          <text class="t1" x="712" y="282">Session</text><text class="t2" x="712" y="302">create · update</text></g>
+        <g class="box w" data-k="sink" tabindex="0" role="button" aria-label="BatchWriter"><rect x="840" y="258" width="120" height="60" rx="8"/>
+          <text class="t1" x="852" y="282">BatchWriter</text><text class="t2" x="852" y="302">split · send</text></g>
+
+        <g class="box t m p w o" data-k="conn" tabindex="0" role="button" aria-label="Connection"><rect x="40" y="368" width="920" height="46" rx="8"/>
+          <text class="t1" x="56" y="388">Connection</text>
+          <text class="t2" x="56" y="405">connect · info · limits · get_flight_info · do_get · do_put · do_action · list_flights · TLS · api_key · compression · errors</text></g>
+
+        <g class="box t m p w o" data-k="server" tabindex="0" role="button" aria-label="mosaicod"><rect x="40" y="466" width="920" height="54" rx="8"/>
+          <text class="t1" x="56" y="488">mosaicod</text>
+          <text class="t2" x="56" y="507">get_flight_info · do_get · do_put · do_action · list_flights</text></g>
+
+        <!-- edge labels -->
+        <text class="el t" x="244" y="296" text-anchor="end">get_flight_info · on open</text>
+        <text class="el t" x="346" y="236">ticket</text>
+        <text class="el t m p" x="346" y="352">do_get</text>
+        <text class="el t" x="406" y="236">batches</text>
+        <text class="el m" x="461" y="352">get_flight_info · sequence</text>
+        <text class="el m" x="551" y="236">K tickets</text>
+        <text class="el m" x="445" y="272" text-anchor="middle">×K</text>
+        <text class="el m" x="606" y="236">slices + order</text>
+        <text class="el p" x="435" y="235" text-anchor="middle">N tickets</text>
+        <text class="el p" x="445" y="272" text-anchor="middle">×N</text>
+        <text class="el p" x="505" y="219" text-anchor="middle">in order</text>
+        <text class="el w" x="714" y="236" text-anchor="end">session · topic</text>
+        <text class="el w" x="766" y="352">do_action</text>
+        <text class="el w" x="894" y="236" text-anchor="end">push_batch</text>
+        <text class="el w" x="906" y="352">do_put</text>
+        <text class="el o" x="186" y="338">list_flights · do_action · query, notifications</text>
+      </svg>

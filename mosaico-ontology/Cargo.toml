@@ -1,0 +1,12 @@
+[package]
+name = "mosaico-ontology"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+mosaico-core.workspace = true
+arrow-array.workspace = true
+arrow-buffer.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

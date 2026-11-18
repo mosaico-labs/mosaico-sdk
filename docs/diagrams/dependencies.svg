@@ -1,0 +1,152 @@
+<svg xmlns="http://www.w3.org/2000/svg" id="deps" viewBox="0 0 1000 650" width="1000" height="650">
+<style>
+#deps {
+  --bg: #f4f5f8; --surface: #ffffff; --fg: #1b1f27; --muted: #5b6374; --line: #d7dbe4; --band: #eceef3;
+  --accent: #2f5bd3;
+  --ft: #2f5bd3; --fm: #0d7f70; --fp: #7a3fc4; --fw: #c2530c; --fo: #5b6374;
+  --display: "Space Grotesk", system-ui, sans-serif;
+  --body: "Inter", system-ui, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, monospace;
+ --display: "Space Grotesk", system-ui, -apple-system, "Segoe UI", sans-serif; --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace; --sel: transparent;}
+@media (prefers-color-scheme: dark) { #deps {
+  --bg: #12151b; --surface: #1a1e26; --fg: #e6e9ef; --muted: #9aa3b4; --line: #2e3440; --band: #161a21;
+  --accent: #8aa6ff;
+  --ft: #8aa6ff; --fm: #4fd1bd; --fp: #c39bff; --fw: #ff9f60; --fo: #b7bfcc; color-scheme: dark } }
+#deps .bg { fill: var(--surface); stroke: var(--line); }
+
+#deps .box rect { fill: var(--surface); stroke: var(--line); stroke-width: 1.5; }
+#deps .t1 { fill: var(--fg); font: 700 15px var(--display); }
+#deps .t1s { fill: var(--fg); font: 700 13px var(--display); }
+#deps .t2 { fill: var(--muted); font: 11px var(--mono); }
+#deps .box[data-k] { cursor: pointer; }
+#deps .box[data-k]:focus { outline: none; }
+#deps .box[data-k]:hover rect, #deps .box.sel rect { fill: var(--sel); }
+#deps .box[data-k]:focus-visible rect { stroke: var(--accent); stroke-width: 3; }
+#deps .dep { fill: none; stroke: var(--fg); stroke-width: 1.6; opacity: .8; marker-end: url(#ah-d); }
+#deps .use { fill: none; stroke: var(--muted); stroke-width: 1.3; stroke-dasharray: 4 4; marker-end: url(#ah-u); }
+#deps .ah-d { fill: var(--fg); } #deps .ah-u { fill: var(--muted); }
+#deps .dl, #deps .ul { font: 600 11px var(--mono); paint-order: stroke; stroke: var(--surface); stroke-width: 4px; stroke-linejoin: round; }
+#deps .dl { fill: var(--fg); } #deps .ul { fill: var(--muted); font-weight: 500; }
+
+#deps .band { fill: var(--band); }
+#deps .bl { fill: var(--muted); font: 600 11px var(--body); letter-spacing: .08em; }
+#deps .box rect { fill: var(--surface); stroke: var(--line); stroke-width: 1.5; transition: stroke .2s; }
+#deps .t1 { fill: var(--fg); font: 700 15px var(--display); }
+#deps .t1s { fill: var(--fg); font: 700 13px var(--display); }
+#deps .t2 { fill: var(--muted); font: 11px var(--mono); }
+#deps .e { fill: none; stroke: var(--line); stroke-width: 2; opacity: .55; }
+#deps .s { fill: none; stroke: var(--muted); stroke-width: 1.5; opacity: .7; }
+#deps .sl { fill: var(--muted); font: 11px var(--mono); }
+#deps .ah-s { fill: var(--muted); }
+#deps .ah-t { fill: var(--ft); } #deps .ah-m { fill: var(--fm); } #deps .ah-p { fill: var(--fp); }
+#deps .ah-w { fill: var(--fw); } #deps .ah-o { fill: var(--fo); }
+#deps .el { display: none; font: 600 11px var(--mono); paint-order: stroke; stroke: var(--surface); stroke-width: 4px; stroke-linejoin: round; }
+#deps[data-flow="t"] .e.t { stroke: var(--ft); marker-end: url(#ah-t); }
+#deps[data-flow="m"] .e.m { stroke: var(--fm); marker-end: url(#ah-m); }
+#deps[data-flow="p"] .e.p { stroke: var(--fp); marker-end: url(#ah-p); }
+#deps[data-flow="w"] .e.w { stroke: var(--fw); marker-end: url(#ah-w); }
+#deps[data-flow="o"] .e.o { stroke: var(--fo); marker-end: url(#ah-o); }
+#deps[data-flow="t"] .e.t, #deps[data-flow="m"] .e.m, #deps[data-flow="p"] .e.p,
+#deps[data-flow="w"] .e.w, #deps[data-flow="o"] .e.o {
+  opacity: 1; stroke-width: 2.5; stroke-dasharray: 7 5; animation: dash .9s linear infinite; }
+#deps[data-flow="t"] .el.t { display: inline; fill: var(--ft); }
+#deps[data-flow="m"] .el.m { display: inline; fill: var(--fm); }
+#deps[data-flow="p"] .el.p { display: inline; fill: var(--fp); }
+#deps[data-flow="w"] .el.w { display: inline; fill: var(--fw); }
+#deps[data-flow="o"] .el.o { display: inline; fill: var(--fo); }
+#deps[data-flow="t"] .box.t rect { stroke: var(--ft); stroke-width: 2.5; }
+#deps[data-flow="m"] .box.m rect { stroke: var(--fm); stroke-width: 2.5; }
+#deps[data-flow="p"] .box.p rect { stroke: var(--fp); stroke-width: 2.5; }
+#deps[data-flow="w"] .box.w rect { stroke: var(--fw); stroke-width: 2.5; }
+#deps[data-flow="o"] .box.o rect { stroke: var(--fo); stroke-width: 2.5; }
+@keyframes dash { to { stroke-dashoffset: -12; } }
+#deps .box[data-k] { cursor: pointer; }
+#deps .box[data-k]:focus { outline: none; }
+#deps .box[data-k]:hover rect, #deps .box.sel rect { fill: var(--sel); }
+#deps .box[data-k]:focus-visible rect { stroke: var(--accent); stroke-width: 3; }
+</style>
+<rect class="bg" x="0.5" y="0.5" width="999" height="649" rx="10"/>
+        <defs>
+          <marker id="ah-d" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="10" markerHeight="10" orient="auto"><path class="ah-d" d="M0 0L10 5L0 10z"/></marker>
+          <marker id="ah-u" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path class="ah-u" d="M0 0L10 5L0 10z"/></marker>
+        </defs>
+
+        <!-- creates -->
+        <path class="dep" d="M590 24 H975 V588"/>
+        <path class="dep" d="M410 49 H222"/>
+        <path class="dep" d="M430 78 V100 H140 V128"/>
+        <path class="dep" d="M480 78 V128"/>
+        <path class="dep" d="M590 70 H820 V128"/>
+        <path class="dep" d="M380 159 H242"/>
+        <path class="dep" d="M580 159 H678"/>
+        <path class="dep" d="M190 188 V248"/>
+        <path class="dep" d="M430 188 V248"/>
+        <path class="dep" d="M400 308 V368"/>
+        <path class="dep" d="M200 308 V488"/>
+        <path class="dep" d="M420 428 V519 H262"/>
+        <path class="dep" d="M715 188 V248"/>
+        <path class="dep" d="M890 188 V248"/>
+        <path class="dep" d="M760 308 V368"/>
+        <path class="dep" d="M880 308 V368"/>
+
+        <!-- uses the connection -->
+        <path class="use" d="M40 49 H28 V588"/>
+        <path class="use" d="M590 46 H966 V588"/>
+        <path class="use" d="M60 188 V588"/>
+        <path class="use" d="M170 548 V588"/>
+        <path class="use" d="M570 188 V588"/>
+        <path class="use" d="M650 308 V588"/>
+        <path class="use" d="M810 428 V588"/>
+
+        <!-- boxes -->
+        <g class="box" data-k="qresp" tabindex="0" role="button" aria-label="QueryResponse"><rect x="40" y="20" width="180" height="58" rx="8"/>
+          <text class="t1" x="52" y="44">QueryResponse</text><text class="t2" x="52" y="64">clusterize · intersect</text></g>
+        <g class="box" data-k="client" tabindex="0" role="button" aria-label="MosaicoClient"><rect x="410" y="20" width="180" height="58" rx="8"/>
+          <text class="t1" x="422" y="44">MosaicoClient</text><text class="t2" x="422" y="64">connect · close</text></g>
+        <g class="box" data-k="topic" tabindex="0" role="button" aria-label="TopicHandler"><rect x="40" y="130" width="200" height="58" rx="8"/>
+          <text class="t1" x="72" y="154">TopicHandler</text><text class="t2" x="72" y="174">metadata · ticket</text></g>
+        <g class="box" data-k="seq" tabindex="0" role="button" aria-label="SequenceHandler"><rect x="380" y="130" width="200" height="58" rx="8"/>
+          <text class="t1" x="392" y="154">SequenceHandler</text><text class="t2" x="392" y="174">metadata · K tickets</text></g>
+        <g class="box" data-k="writer" tabindex="0" role="button" aria-label="SequenceWriter and SequenceUpdater"><rect x="680" y="130" width="280" height="58" rx="8"/>
+          <text class="t1s" x="692" y="153">SequenceWriter · SequenceUpdater</text><text class="t2" x="692" y="174">one write session</text></g>
+        <g class="box" data-k="streamer" tabindex="0" role="button" aria-label="Streamers"><rect x="150" y="250" width="300" height="58" rx="8"/>
+          <text class="t1" x="162" y="274">Streamers</text><text class="t2" x="162" y="294">messages · batches · to_arrow</text></g>
+        <g class="box" data-k="session" tabindex="0" role="button" aria-label="Session"><rect x="640" y="250" width="150" height="58" rx="8"/>
+          <text class="t1" x="652" y="274">Session</text><text class="t2" x="652" y="294">lifecycle</text></g>
+        <g class="box" data-k="twriter" tabindex="0" role="button" aria-label="TopicWriter"><rect x="820" y="250" width="140" height="58" rx="8"/>
+          <text class="t1" x="832" y="274">TopicWriter</text><text class="t2" x="832" y="294">builder</text></g>
+        <g class="box" data-k="multi" tabindex="0" role="button" aria-label="MultiReader"><rect x="330" y="370" width="180" height="58" rx="8"/>
+          <text class="t1" x="342" y="394">MultiReader</text><text class="t2" x="342" y="414">merge · concat</text></g>
+        <g class="box" data-k="sink" tabindex="0" role="button" aria-label="BatchWriter"><rect x="720" y="370" width="180" height="58" rx="8"/>
+          <text class="t1" x="732" y="394">BatchWriter</text><text class="t2" x="732" y="414">one do_put</text></g>
+        <g class="box" data-k="stream" tabindex="0" role="button" aria-label="BatchReader"><rect x="80" y="490" width="180" height="58" rx="8"/>
+          <text class="t1" x="92" y="514">BatchReader</text><text class="t2" x="92" y="534">one do_get</text></g>
+        <g class="box" data-k="conn" tabindex="0" role="button" aria-label="Connection"><rect x="20" y="590" width="960" height="46" rx="8"/>
+          <text class="t1" x="36" y="610">Connection</text>
+          <text class="t2" x="36" y="627">one per MosaicoClient · cloned into every block that calls mosaicod</text></g>
+
+        <!-- labels -->
+        <text class="dl" x="782" y="18" text-anchor="middle">connect()</text>
+        <text class="ul" x="782" y="40" text-anchor="middle">list_flights · do_action</text>
+        <text class="dl" x="316" y="43" text-anchor="middle">query()</text>
+        <text class="dl" x="285" y="94" text-anchor="middle">topic_handler()</text>
+        <text class="dl" x="488" y="110">sequence_handler()</text>
+        <text class="dl" x="720" y="64" text-anchor="middle">sequence_create() · sequence_update()</text>
+        <text class="dl" x="311" y="152" text-anchor="middle">topic_handler()</text>
+        <text class="dl" x="629" y="152" text-anchor="middle">update()</text>
+        <text class="dl" x="198" y="222">get_*_streamer()</text>
+        <text class="dl" x="438" y="222">get_data_streamer()</text>
+        <text class="dl" x="408" y="342">merge · concat</text>
+        <text class="dl" x="208" y="400">one topic</text>
+        <text class="dl" x="340" y="512" text-anchor="middle">×K topics · ×N ranges</text>
+        <text class="dl" x="723" y="222">owns</text>
+        <text class="dl" x="882" y="222" text-anchor="end">topic_create()</text>
+        <text class="dl" x="752" y="342" text-anchor="end">create_topic()</text>
+        <text class="dl" x="888" y="342">push_batch</text>
+        <text class="ul" transform="translate(24 330) rotate(-90)" text-anchor="middle">do_action</text>
+        <text class="ul" x="66" y="578">get_flight_info</text>
+        <text class="ul" x="178" y="578">do_get</text>
+        <text class="ul" x="562" y="578" text-anchor="end">get_flight_info</text>
+        <text class="ul" x="658" y="578">do_action</text>
+        <text class="ul" x="818" y="578">do_put</text>
+      </svg>
