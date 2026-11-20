@@ -61,7 +61,7 @@ async fn read_once(
     let mut count = 0u64;
     let mut total = 0.0;
     while let Some(msg) = streamer.next().await? {
-        total += msg.data.acceleration()?.z()?;
+        total += msg.view.acceleration()?.z()?;
         count += 1;
     }
     Ok((count, total, started.elapsed()))

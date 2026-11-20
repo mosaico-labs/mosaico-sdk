@@ -1,8 +1,13 @@
-use arrow_array::StructArray;
+use std::sync::Arc;
+
+use arrow_array::builder::{Int32Builder, UInt32Builder};
 use arrow_array::types::{Int32Type, UInt32Type};
+use arrow_array::{ArrayRef, StructArray};
+use arrow_schema::{DataType, Field, Fields};
 use mosaico_core::Result;
 
-use crate::columns::Required;
+use crate::arrow::build::StructBuilder;
+use crate::arrow::columns::Required;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Time {
@@ -48,5 +53,34 @@ impl<'a> TimeView<'a> {
             seconds: self.seconds()?,
             nanoseconds: self.nanoseconds()?,
         })
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct TimeBuilder {
+    seconds: Int32Builder,
+    nanoseconds: UInt32Builder,
+}
+
+impl StructBuilder<Time> for TimeBuilder {
+    fn fields() -> Fields {
+        Fields::from(vec![
+            Field::new("seconds", DataType::Int32, false),
+            Field::new("nanoseconds", DataType::UInt32, false),
+        ])
+    }
+
+    fn append(&mut self, value: Option<&Time>) {
+        self.seconds
+            .append_value(value.map_or(0, |time| time.seconds));
+        self.nanoseconds
+            .append_value(value.map_or(0, |time| time.nanoseconds));
+    }
+
+    fn finish(&mut self) -> Vec<ArrayRef> {
+        vec![
+            Arc::new(self.seconds.finish()),
+            Arc::new(self.nanoseconds.finish()),
+        ]
     }
 }

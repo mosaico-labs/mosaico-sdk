@@ -1,8 +1,8 @@
 use arrow_array::cast::AsArray;
 use arrow_array::types::{ArrowPrimitiveType, Float64Type};
 use arrow_array::{
-    Array, ArrayRef, Float64Array, GenericListArray, PrimitiveArray, StringArray, StringViewArray,
-    StructArray,
+    Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Float64Array, GenericListArray,
+    PrimitiveArray, StringArray, StringViewArray, StructArray,
 };
 use arrow_buffer::NullBuffer;
 use mosaico_core::{Error, Result};
@@ -81,6 +81,42 @@ enum Strings {
     Utf8View(StringViewArray),
 }
 
+impl Strings {
+    fn new(column: &ArrayRef, path: &str) -> Result<Self> {
+        if let Some(array) = column.as_string_opt::<i32>() {
+            Ok(Self::Utf8(array.clone()))
+        } else if let Some(array) = column.as_string_view_opt() {
+            Ok(Self::Utf8View(array.clone()))
+        } else {
+            Err(wrong_type(path))
+        }
+    }
+
+    fn get(&self, row: usize) -> Option<&str> {
+        match self {
+            Self::Utf8(array) => array.is_valid(row).then(|| array.value(row)),
+            Self::Utf8View(array) => array.is_valid(row).then(|| array.value(row)),
+        }
+    }
+}
+
+pub(crate) struct RequiredString {
+    array: Strings,
+    path: String,
+}
+
+impl RequiredString {
+    pub(crate) fn new(parent: &StructArray, path: &str, name: &str) -> Result<Self> {
+        let path = child_path(path, name);
+        let array = Strings::new(required_column(parent, name, &path)?, &path)?;
+        Ok(Self { array, path })
+    }
+
+    pub(crate) fn get(&self, row: usize) -> Result<&str> {
+        self.array.get(row).ok_or_else(|| null_in(&self.path))
+    }
+}
+
 pub(crate) struct OptionalString {
     array: Option<Strings>,
 }
@@ -89,22 +125,70 @@ impl OptionalString {
     pub(crate) fn new(parent: &StructArray, path: &str, name: &str) -> Result<Self> {
         let array = match parent.column_by_name(name) {
             None => None,
-            Some(column) => Some(if let Some(array) = column.as_string_opt::<i32>() {
-                Strings::Utf8(array.clone())
-            } else if let Some(array) = column.as_string_view_opt() {
-                Strings::Utf8View(array.clone())
-            } else {
-                return Err(wrong_type(&child_path(path, name)));
-            }),
+            Some(column) => Some(Strings::new(column, &child_path(path, name))?),
         };
         Ok(Self { array })
     }
 
     pub(crate) fn get(&self, row: usize) -> Option<&str> {
-        match self.array.as_ref()? {
-            Strings::Utf8(array) => array.is_valid(row).then(|| array.value(row)),
-            Strings::Utf8View(array) => array.is_valid(row).then(|| array.value(row)),
-        }
+        self.array.as_ref()?.get(row)
+    }
+}
+
+enum Binaries {
+    Binary(BinaryArray),
+    BinaryView(BinaryViewArray),
+}
+
+pub(crate) struct RequiredBinary {
+    array: Binaries,
+    path: String,
+}
+
+impl RequiredBinary {
+    pub(crate) fn new(parent: &StructArray, path: &str, name: &str) -> Result<Self> {
+        let path = child_path(path, name);
+        let column = required_column(parent, name, &path)?;
+        let array = if let Some(array) = column.as_binary_opt::<i32>() {
+            Binaries::Binary(array.clone())
+        } else if let Some(array) = column.as_binary_view_opt() {
+            Binaries::BinaryView(array.clone())
+        } else {
+            return Err(wrong_type(&path));
+        };
+        Ok(Self { array, path })
+    }
+
+    pub(crate) fn get(&self, row: usize) -> Result<&[u8]> {
+        let value = match &self.array {
+            Binaries::Binary(array) => array.is_valid(row).then(|| array.value(row)),
+            Binaries::BinaryView(array) => array.is_valid(row).then(|| array.value(row)),
+        };
+        value.ok_or_else(|| null_in(&self.path))
+    }
+}
+
+pub(crate) struct OptionalBool {
+    array: Option<BooleanArray>,
+}
+
+impl OptionalBool {
+    pub(crate) fn new(parent: &StructArray, path: &str, name: &str) -> Result<Self> {
+        let array = match parent.column_by_name(name) {
+            None => None,
+            Some(column) => Some(
+                column
+                    .as_boolean_opt()
+                    .ok_or_else(|| wrong_type(&child_path(path, name)))?
+                    .clone(),
+            ),
+        };
+        Ok(Self { array })
+    }
+
+    pub(crate) fn get(&self, row: usize) -> Option<bool> {
+        let array = self.array.as_ref()?;
+        array.is_valid(row).then(|| array.value(row))
     }
 }
 

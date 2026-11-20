@@ -1,11 +1,16 @@
-use arrow_array::{RecordBatch, StructArray};
-use mosaico_core::{Ontology, Result};
+use arrow_array::{ArrayRef, RecordBatch, StructArray};
+use arrow_schema::Fields;
+use mosaico_core::{Encode, Format, Ontology, RecordBuilder, Result};
 
-use crate::columns::{OptionalStruct, RequiredStruct};
-use crate::geometry::{
-    Quaternion, QuaternionColumns, QuaternionView, Vector3d, Vector3dColumns, Vector3dView,
+use crate::arrow::build::{Nested, struct_field};
+use crate::arrow::columns::{OptionalStruct, RequiredStruct};
+use crate::data::geometry::{
+    Quaternion, QuaternionBuilder, QuaternionColumns, QuaternionView, Vector3d, Vector3dBuilder,
+    Vector3dColumns, Vector3dView,
 };
-use crate::header::{Header, HeaderColumns, HeaderView};
+use crate::data::header::{
+    Header, HeaderColumns, HeaderView, OptionalHeader, header_field, header_size,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Imu {
@@ -85,5 +90,52 @@ impl Ontology for Imu {
 
     fn from_view(view: &ImuView<'_>) -> Result<Imu> {
         view.to_model()
+    }
+}
+
+#[derive(Default)]
+pub struct ImuBuilder {
+    header: OptionalHeader,
+    acceleration: Nested<Vector3d, Vector3dBuilder>,
+    angular_velocity: Nested<Vector3d, Vector3dBuilder>,
+    orientation: Nested<Quaternion, QuaternionBuilder>,
+}
+
+impl RecordBuilder<Imu> for ImuBuilder {
+    fn append(&mut self, value: &Imu) {
+        self.header.append(value.header.as_ref());
+        self.acceleration.append(Some(&value.acceleration));
+        self.angular_velocity.append(Some(&value.angular_velocity));
+        self.orientation.append(value.orientation.as_ref());
+    }
+
+    fn finish(&mut self) -> Vec<ArrayRef> {
+        vec![
+            self.header.finish(),
+            self.acceleration.finish(),
+            self.angular_velocity.finish(),
+            self.orientation.finish(),
+        ]
+    }
+}
+
+impl Encode for Imu {
+    const FORMAT: Format = Format::Default;
+    type Builder = ImuBuilder;
+
+    fn fields() -> Fields {
+        Fields::from(vec![
+            header_field(),
+            struct_field::<Vector3d, Vector3dBuilder>("acceleration", false),
+            struct_field::<Vector3d, Vector3dBuilder>("angular_velocity", false),
+            struct_field::<Quaternion, QuaternionBuilder>("orientation", true),
+        ])
+    }
+
+    fn size(&self) -> usize {
+        header_size(&self.header)
+            + self.acceleration.size()
+            + self.angular_velocity.size()
+            + self.orientation.as_ref().map_or(0, Quaternion::size)
     }
 }
