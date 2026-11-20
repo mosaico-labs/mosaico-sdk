@@ -58,13 +58,19 @@ impl<T: AsyncWrite + Unpin> BufferedWrites<T> {
     }
 }
 
-impl<T: AsyncRead + Unpin> AsyncRead for BufferedWrites<T> {
+impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for BufferedWrites<T> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_read(cx, buf)
+        let this = &mut *self;
+        if !this.buf.is_empty()
+            && let Poll::Ready(Err(error)) = this.poll_drain(cx)
+        {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(&mut this.inner).poll_read(cx, buf)
     }
 }
 
@@ -155,6 +161,16 @@ mod tests {
         }
     }
 
+    impl AsyncRead for Recorder {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
     fn pattern(len: usize) -> Vec<u8> {
         (0..len).map(|i| (i % 251) as u8).collect()
     }
@@ -186,6 +202,20 @@ mod tests {
         assert!(io.inner.data.is_empty());
         io.flush().await.unwrap();
         assert_eq!(io.inner.data, b"ping");
+    }
+
+    #[test]
+    fn a_read_sends_what_a_deferred_flush_kept_first() {
+        let mut io = BufferedWrites::new(Recorder::default());
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let written = Pin::new(&mut io).poll_write(&mut cx, b"client hello");
+        assert!(matches!(written, Poll::Ready(Ok(12))));
+        assert!(Pin::new(&mut io).poll_flush(&mut cx).is_ready());
+        assert!(io.inner.data.is_empty());
+        let mut space = [0u8; 16];
+        let mut buf = ReadBuf::new(&mut space);
+        assert!(Pin::new(&mut io).poll_read(&mut cx, &mut buf).is_pending());
+        assert_eq!(io.inner.data, b"client hello");
     }
 
     #[tokio::test]

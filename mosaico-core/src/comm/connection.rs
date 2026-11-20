@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use arrow_flight::flight_service_client::FlightServiceClient;
@@ -16,6 +17,7 @@ use super::action::ActionKind;
 use super::proto;
 use crate::error::{Error, ErrorKind, Result};
 use crate::scope::Scope;
+use crate::write::batch_writer::WriteBudget;
 
 const CONNECT_RETRY: Duration = Duration::from_millis(25);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -116,6 +118,7 @@ pub(crate) struct Connection {
     scope: Scope,
     endpoint: Endpoint,
     api_key: ApiKey,
+    budget: Arc<WriteBudget>,
 }
 
 impl Connection {
@@ -152,6 +155,7 @@ impl Connection {
         let info = wait_for_info(&channel, &api_key, &address, options.connect_timeout).await?;
         Ok(Self {
             client: flight_client(channel, &api_key, &info, options.compression),
+            budget: Arc::new(WriteBudget::for_server(&info)),
             info,
             compression: options.compression,
             scope: Scope::root(),
@@ -173,7 +177,12 @@ impl Connection {
             scope: self.scope.clone(),
             endpoint: self.endpoint.clone(),
             api_key: self.api_key.clone(),
+            budget: self.budget.clone(),
         }
+    }
+
+    pub(crate) fn write_budget(&self) -> &Arc<WriteBudget> {
+        &self.budget
     }
 
     pub(crate) fn info(&self) -> &ServerInfo {
@@ -366,7 +375,9 @@ fn flight_client(
         .max_decoding_message_size(to_usize(info.max_encode_message_size))
         .max_encoding_message_size(to_usize(info.max_decode_message_size));
     match compression {
-        Compression::Gzip => client.send_compressed(CompressionEncoding::Gzip),
+        Compression::Gzip => client
+            .send_compressed(CompressionEncoding::Gzip)
+            .accept_compressed(CompressionEncoding::Gzip),
         Compression::None | Compression::Lz4 | Compression::Zstd => client,
     }
 }

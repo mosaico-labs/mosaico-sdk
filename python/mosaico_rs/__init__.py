@@ -1,9 +1,11 @@
 from ._client import MosaicoClient
 from ._errors import (
+    AlreadyExistsError,
     ConnectError,
     InvalidArgumentError,
     MosaicoError,
     OntologyMismatchError,
+    PermissionDeniedError,
     SchemaError,
     SequenceNotFoundError,
     ServerError,
@@ -24,6 +26,7 @@ from ._reader import (
 from ._writer import SequenceUpdater, SequenceWriter, TopicWriter
 
 __all__ = [
+    "AlreadyExistsError",
     "ConnectError",
     "HeaderView",
     "IMUView",
@@ -32,6 +35,7 @@ __all__ = [
     "MosaicoClient",
     "MosaicoError",
     "OntologyMismatchError",
+    "PermissionDeniedError",
     "QuaternionView",
     "SchemaError",
     "SequenceHandler",

@@ -7,7 +7,7 @@ use crate::comm::action::ActionKind;
 use crate::comm::connection::Connection;
 use crate::comm::proto;
 use crate::error::{Error, ErrorKind, Result};
-use crate::locator::{sequence_name, topic_name};
+use crate::locator::{new_sequence_name, sequence_name, topic_name};
 use crate::ontology::Format;
 use crate::scope::Scope;
 use crate::write::batch_writer::BatchWriter;
@@ -53,7 +53,7 @@ impl Session {
         metadata: Option<Vec<u8>>,
         policy: SessionErrorPolicy,
     ) -> Result<Self> {
-        let sequence = sequence_name(sequence)?.to_owned();
+        let sequence = new_sequence_name(sequence)?.to_owned();
         let request = proto::SequenceCreate {
             locator: sequence.clone(),
             user_metadata: metadata.unwrap_or_default(),

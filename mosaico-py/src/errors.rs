@@ -8,6 +8,8 @@ pyo3::import_exception!(mosaico_rs._errors, ConnectError);
 pyo3::import_exception!(mosaico_rs._errors, SequenceNotFoundError);
 pyo3::import_exception!(mosaico_rs._errors, TopicNotFoundError);
 pyo3::import_exception!(mosaico_rs._errors, InvalidArgumentError);
+pyo3::import_exception!(mosaico_rs._errors, AlreadyExistsError);
+pyo3::import_exception!(mosaico_rs._errors, PermissionDeniedError);
 pyo3::import_exception!(mosaico_rs._errors, ServerError);
 pyo3::import_exception!(mosaico_rs._errors, StreamError);
 pyo3::import_exception!(mosaico_rs._errors, SchemaError);
@@ -19,6 +21,10 @@ pub(crate) fn to_py(error: Error) -> PyErr {
         ErrorKind::Connection => ConnectError::new_err(message),
         ErrorKind::NotFound => TopicNotFoundError::new_err(message),
         ErrorKind::InvalidArgument => InvalidArgumentError::new_err(message),
+        ErrorKind::AlreadyExists => AlreadyExistsError::new_err(message),
+        ErrorKind::Unauthenticated | ErrorKind::PermissionDenied => {
+            PermissionDeniedError::new_err(message)
+        }
         ErrorKind::Closed => StreamClosedError::new_err(message),
         ErrorKind::Stream => StreamError::new_err(message),
         ErrorKind::Schema => SchemaError::new_err(message),

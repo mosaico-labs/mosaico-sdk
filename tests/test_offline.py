@@ -1,4 +1,5 @@
 import socket
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -23,11 +24,14 @@ def test_error_hierarchy() -> None:
     assert issubclass(m.InvalidArgumentError, ValueError)
     assert issubclass(m.StreamClosedError, ValueError)
     assert issubclass(m.SchemaError, ValueError)
+    assert issubclass(m.PermissionDeniedError, PermissionError)
     for error in (
         m.ConnectError,
         m.SequenceNotFoundError,
         m.TopicNotFoundError,
         m.InvalidArgumentError,
+        m.AlreadyExistsError,
+        m.PermissionDeniedError,
         m.OntologyMismatchError,
         m.ServerError,
         m.StreamError,
@@ -76,6 +80,34 @@ def test_tls_cert_errors_match_sdk(tmp_path: Path) -> None:
     for path in ("", str(tmp_path)):
         with pytest.raises(m.InvalidArgumentError):
             m.MosaicoClient.connect("localhost", free_port(), tls_cert_path=path)
+
+
+def test_tls_connections_send_the_client_hello() -> None:
+    received: list[bytes] = []
+    with socket.socket() as server:
+        server.bind(("127.0.0.1", 0))
+        server.listen(4)
+        server.settimeout(5)
+        port = server.getsockname()[1]
+
+        def accept() -> None:
+            try:
+                conn, _ = server.accept()
+            except OSError:
+                return
+            with conn:
+                conn.settimeout(3)
+                try:
+                    received.append(conn.recv(5))
+                except OSError:
+                    received.append(b"")
+
+        thread = threading.Thread(target=accept, daemon=True)
+        thread.start()
+        with pytest.raises(m.ConnectError):
+            m.MosaicoClient.connect("127.0.0.1", port, timeout=1, enable_tls=True)
+        thread.join(5)
+    assert received and received[0][:1] == b"\x16"
 
 
 def test_columns_without_data_use_the_server_types() -> None:

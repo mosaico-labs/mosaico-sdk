@@ -8,7 +8,7 @@ use pyo3::exceptions::PyBaseException;
 use pyo3::prelude::*;
 use tokio::sync::Mutex;
 
-use crate::arrow::ffi::{KnownSchema, import_batch, import_schema};
+use crate::arrow::ffi::{Imported, KnownSchema, import_batch, import_schema};
 use crate::errors::{MosaicoError, StreamClosedError, invalid, parse_seconds, to_py};
 use crate::record;
 use crate::runtime::{Closing, ProcessBound, run, run_now, wait, wait_closing};
@@ -223,6 +223,13 @@ impl TopicWriter {
     fn known_schema(&self) -> std::sync::MutexGuard<'_, Option<Arc<KnownSchema>>> {
         self.1.lock().unwrap_or_else(PoisonError::into_inner)
     }
+
+    fn import(&self, batch: &Bound<'_, PyAny>) -> Result<Imported, String> {
+        let known = self.known_schema().clone();
+        let imported = import_batch(batch, known)?;
+        *self.known_schema() = Some(imported.known().clone());
+        Ok(imported)
+    }
 }
 
 #[pymethods]
@@ -259,14 +266,21 @@ impl TopicWriter {
 
     fn push_batch(&self, py: Python<'_>, batch: &Bound<'_, PyAny>) -> PyResult<()> {
         let writer = self.0.get()?;
-        let known = self.known_schema().clone();
-        let batch = import_batch(batch, known);
-        if let Ok(batch) = &batch {
-            *self.known_schema() = Some(batch.known().clone());
-        }
+        let batch = self.import(batch);
         run(py, async {
-            match batch.and_then(|batch| batch.owned()) {
+            match batch.and_then(Imported::owned) {
                 Ok(batch) => writer.push_batch(batch).await,
+                Err(message) => Err(writer.reject(Error::invalid_argument(message)).await),
+            }
+        })
+    }
+
+    fn push_row(&self, py: Python<'_>, row: &Bound<'_, PyAny>, size: usize) -> PyResult<()> {
+        let writer = self.0.get()?;
+        let row = self.import(row);
+        run_now(py, async {
+            match row.and_then(Imported::owned) {
+                Ok(row) => writer.push_row(row, size).await,
                 Err(message) => Err(writer.reject(Error::invalid_argument(message)).await),
             }
         })
@@ -293,16 +307,6 @@ impl TopicWriter {
     fn handle_error(&self, py: Python<'_>, reason: &str) -> PyResult<bool> {
         let writer = self.0.get()?;
         wait(py, writer.handle_error(reason))
-    }
-
-    fn accepted(&self) -> PyResult<()> {
-        self.0.get()?.accepted();
-        Ok(())
-    }
-
-    fn record_too_large(&self, py: Python<'_>, size: usize) -> PyResult<()> {
-        let writer = self.0.get()?;
-        run(py, writer.record_too_large(size))
     }
 
     fn reject(&self, py: Python<'_>, message: &str) -> PyResult<Py<PyBaseException>> {

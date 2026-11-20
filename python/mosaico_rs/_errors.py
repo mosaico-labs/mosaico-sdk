@@ -18,6 +18,14 @@ class InvalidArgumentError(MosaicoError, ValueError):
     pass
 
 
+class AlreadyExistsError(MosaicoError):
+    pass
+
+
+class PermissionDeniedError(MosaicoError, PermissionError):
+    pass
+
+
 class OntologyMismatchError(MosaicoError):
     pass
 

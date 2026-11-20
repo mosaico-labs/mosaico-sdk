@@ -2,6 +2,8 @@
 
 Draft of the design of the Mosaico SDK.
 
+Parts marked *planned* are designed but not in the code yet: multi-topic reads and parallel ranges, queries, `CancelToken`, the Rust `blocking` module and `RowRef`.
+
 ## Layers
 
 ![SDK layers](docs/diagrams/layers.svg)
@@ -25,7 +27,7 @@ Draft of the design of the Mosaico SDK.
 
 A topic with no data gives an empty stream. Reads are independent: several can run at once on the same topic. Ranges include the start and exclude the end.
 
-### Multi-topic read
+### Multi-topic read · planned
 
 ![Multi-topic read](docs/diagrams/multi-topic-read.svg)
 
@@ -34,7 +36,7 @@ A topic with no data gives an empty stream. Reads are independent: several can r
 3. The `MultiReader` opens K streams and merges them by timestamp into windows: one slice per topic plus the row order. Equal timestamps follow the topic order.
 4. The handler walks the order and yields `(topic, msg)`, with `msg.data` as a view.
 
-### Parallel ranges
+### Parallel ranges · planned
 
 ![Parallel ranges](docs/diagrams/parallel-ranges.svg)
 
@@ -46,17 +48,17 @@ The handler splits a time range into N parts and asks for one ticket per part. T
 
 1. `sequence_create()` or `sequence_update()` opens a write session with `do_action`.
 2. `topic_create()` creates the topic and opens its `BatchWriter` with `do_put`.
-3. `push` appends the row to the topic's builder in the core and hands it to the `BatchWriter` at about 1 MiB, or earlier on the flush policy limits. Builders exist for the ontologies written by hand (IMU, Image, CompressedImage); in Python the other ontologies are buffered as in today's SDK and sent with `push_batch`. A row that alone exceeds the server limit is dropped, notified and counted, and the writer status becomes `RecordTooLarge`.
-4. The `BatchWriter` splits batches under the server limit and sends them in the background.
+3. `push` appends the row to the topic's builder in the core and hands it to the `BatchWriter` at about 1 MiB, or earlier on the flush policy limits. Builders exist for the ontologies written by hand (IMU, Image, CompressedImage). For the other ontologies Python converts the message to one Arrow row, as today's SDK does, and the core buffers the rows with `push_row` under the same rules. A row that alone exceeds the server limit is dropped, notified and counted, and the writer status becomes `RecordTooLarge`.
+4. The `BatchWriter` splits batches under the server limit and sends them in the background. The queued data of all topics shares one budget per client: when it is full, the topics send what they have joined so far.
 5. Leaving the `with` block (or `finish()` in Rust) waits for the sends and finalizes the session. On error, the session policy deletes or reports it. Server errors surface at the next push or when the session finishes.
 
 ### Other operations
 
 ![Other operations](docs/diagrams/other-operations.svg)
 
-- Sequence lists go through `list_flights`, one page at a time. Queries, notifications and deletes go through `do_action`. All on the same connection.
-- Queries are built in each SDK and run by the core.
-- Reads and queries accept a `CancelToken`: cancelling it stops the call and its streams.
+- Sequence lists go through `list_flights` in a single call: the protocol has no cursor. Queries, notifications and deletes go through `do_action`. All on the same connection.
+- *Planned:* queries are built in each SDK and run by the core.
+- *Planned:* reads and queries accept a `CancelToken`: cancelling it stops the call and its streams. Until then `close()` stops them.
 - `close()` on the client, a sequence or a topic closes every stream opened below it. A handler stays usable after `close()`. Closing the client is permanent.
 
 ## Dependencies
@@ -83,14 +85,14 @@ The Python package, rebuilt on the Rust core through PyO3. Calls are synchronous
 | `msg.data` (type without generated code) | Open: a generic view built at runtime from the topic schema, with the same access and no static types |
 | `msg.get_data()` | Owned ontology object, a copy of the row |
 | `to_pandas(start, end)` | One DataFrame with dotted column names |
-| `MosaicoError` | Base class of every exception the SDK raises |
+| `MosaicoError` | Base class of every exception the SDK raises. Subclasses by cause: `ConnectError` (also a `ConnectionError`), `SequenceNotFoundError`, `TopicNotFoundError`, `InvalidArgumentError`, `SchemaError` and `StreamClosedError` (also `ValueError`), `AlreadyExistsError`, `PermissionDeniedError` (missing or wrong API key, also a `PermissionError`), `OntologyMismatchError`, `StreamError`, and `ServerError` for the rest |
 | `image_from_linear_pixels(data, stride, height, width, encoding)` | Same signature as today's SDK; PNG is encoded in Rust without the GIL, same layout (8-bit gray, height × stride). A size mismatch raises instead of falling back to RAW |
 | `encode_png(data, height, stride)` · `encode_png_batch(batch)` | PNG of one buffer, or of every `raw` row of an `Image` batch on all cores, for `push_batch` |
 | `decode_png(data)` · `decode_png_batch(batch)` · `decode_png_table(table)` | Back to the raw bytes, as `to_linear_pixels` of today's SDK but returning `bytes`. The batch and table forms decode every `png` row and mark it `raw`; the table form decodes all its rows on all cores (the server sends images a row or two per batch). Every PNG type gives the same bytes as Pillow, which today's SDK uses (low bit depths expanded to one byte per pixel, 16-bit color to 8 bits). An invalid PNG raises instead of returning the data unchanged. `MOSAICO_PNG_THREADS` limits the threads of encoding and decoding |
 
 ### Rust SDK · public
 
-The core crate itself, used directly by Rust programs. Async on tokio, with a blocking module that mirrors the same API. Errors are `Result<T, Error>` with an error kind. Generated ontology types read rows as typed views.
+The core crate itself, used directly by Rust programs. Async on tokio; a blocking module that mirrors the same API is planned. Errors are `Result<T, Error>` with an error kind. Generated ontology types read rows as typed views.
 
 | Member | What it does |
 |---|---|
@@ -99,14 +101,16 @@ The core crate itself, used directly by Rust programs. Async on tokio, with a bl
 | `while let Some(msg) = s.next().await?` | Iteration over messages or batches |
 | `trait Ontology` | `TAG`, `Columns`, `View<'a>` and `from_view`, one per generated type. Columns are looked up and checked once per batch; a view is a row index into them |
 | `view.acceleration()?.z()?` | View fields are methods returning `Result`, since a required field can be null. The owned model has plain pub fields |
-| `blocking::MosaicoClient` | The same API without async |
+| `blocking::MosaicoClient` | *Planned.* The same API without async |
 | `Error::kind()` | Connection, not found, invalid argument, schema, closed, server, … |
 | `RecordBatch` | arrow-rs batches, passed without conversion |
 | `encode_png_column(&[Pixels])` · `encode_png_batch(&batch)` | Raw images to the PNG `data` column of `Image`, on all cores: the layout of today's SDK (8-bit gray, height × stride). The batch form encodes only the `raw` rows. Behind the `png` feature |
 | `decode_png(&[u8])` · `decode_png_column` · `decode_png_batch` · `decode_png_batches(&[batch])` | PNG back to raw bytes, the same bytes as today's SDK; the batch forms decode the `png` rows on all cores. Behind the `png` feature |
 | `trait Encode` · `RecordBuilder` | Write side of an ontology: `FORMAT`, payload `fields()`, `size()` of a row and a builder that appends rows to Arrow columns. Written by hand for `Imu`, `Image`, `CompressedImage` |
 | `seq.topic_create_for::<Imu>(name, metadata, on_error)` · `topic.push(ts, &imu)` | Typed write: the topic schema comes from the type, rows go through the builder |
-| `RowRef` · `view::<T>()` | Multi-topic reads: one row of any topic, read as type `T`; `None` if the topic is not of type `T` |
+| `topic.push_row(row, size)` | One record already in Arrow (one row with the topic schema) and its encoded size: buffered and sent like typed records. The Python package uses it for the ontologies without a builder |
+| `topic.push_stream(stream)` | Any `Stream` of `Result<RecordBatch, E>`, pushed batch by batch. Reading the source is up to the caller, so it never blocks the runtime |
+| `RowRef` · `view::<T>()` | *Planned*, with multi-topic reads: one row of any topic, read as type `T`; `None` if the topic is not of type `T` |
 | `view.to_model()` · `msg.to_model()` | Owned copy of a typed view: an `ImuView` gives an `Imu` |
 
 ### MosaicoClient · public
@@ -118,11 +122,11 @@ Entry point. Holds the single connection and reads the server version and limits
 | `connect(host, port, tls, api_key, compression)` | Opens the connection and calls `info` |
 | `sequence_handler(name)` | `SequenceHandler`. Raises if the sequence does not exist |
 | `topic_handler(sequence, topic, ontology=…)` | `TopicHandler`, checked against the ontology |
-| `sequence_create(name, metadata)` · `sequence_update(name)` | A write session, used in a `with` block |
-| `list_sequences()` · `sequence_delete(name)` · `session_delete(locator)` | Lists through `list_flights`, a page at a time; deletes through `do_action` |
-| `sequence_exists(name)` · `topic_exists(sequence, topic)` | `False` only when the server answers not found; other errors raise |
+| `sequence_create(name, metadata)` · `sequence_update(name)` | A write session, used in a `with` block. A new name is checked as in today's SDK: letters, digits, `-` and `_`, starting with a letter or a digit; otherwise `InvalidArgumentError` |
+| `list_sequences()` · `sequence_delete(name)` · `session_delete(locator)` | `list_sequences` returns every name in one call through `list_flights`; deletes go through `do_action` |
+| `sequence_exists(name)` · `topic_exists(sequence, topic)` | `False` when the server answers not found or rejects the name as invalid; other errors raise |
 | `list_*_notifications(…)` · `clear_*_notifications(…)` | Notifications of a sequence or topic, such as dropped records or a failed session |
-| `query(…)` | Runs a query. Results grouped by sequence |
+| `query(…)` | *Planned.* Runs a query. Results grouped by sequence |
 | `close()` | Closes every stream of the client and its handlers. Permanent: later calls fail as closed |
 
 ### TopicHandler · public
@@ -136,7 +140,7 @@ One topic. Opening it reads the metadata once: ontology tag, time range and tick
 | `get_batch_streamer(start, end)` | Plain Arrow record batches; also an Arrow stream that DuckDB, Polars or a C program read directly |
 | `to_arrow(start, end)` | One Arrow table, without copies. In Rust the schema and the batches. Without data the schema is the same as with data: top-level strings and binaries as views, as mosaicod sends them |
 | `to_pandas(start, end)` | One DataFrame (Python only) |
-| `cancel=token` | Accepted by every read; cancelling stops the stream |
+| `cancel=token` | *Planned.* Accepted by every read; cancelling stops the stream |
 | `close()` | Closes every stream opened from this handler and its clones. The handler stays usable |
 
 ### SequenceHandler · public
@@ -147,7 +151,7 @@ One sequence. A single `get_flight_info` returns the metadata and the tickets of
 |---|---|
 | `topics` · `sessions` · `user_metadata` · `timestamp_ns_min/max` | Metadata read at open |
 | `topic_handler(topic, ontology=…)` | `TopicHandler` built from the saved ticket |
-| `get_data_streamer(topics, start, end)` | `(TopicHandler, msg)` in global time order. In Rust `msg` is a `RowRef` |
+| `get_data_streamer(topics, start, end)` | *Planned.* `(TopicHandler, msg)` in global time order. In Rust `msg` is a `RowRef` |
 | `update()` | `SequenceUpdater` for this sequence |
 | `close()` | Closes the streams of all its topic handlers. The handler stays usable |
 
@@ -157,7 +161,7 @@ A write session: a new sequence (`sequence_create`) or new topics in an existing
 
 | Member | What it does |
 |---|---|
-| `topic_create(name, ontology, metadata, on_error)` | A `TopicWriter` for one topic |
+| `topic_create(name, ontology, metadata, on_error)` | A `TopicWriter` for one topic. The name is checked as in today's SDK (letters, digits, `-`, `_` and `/`, starting with a letter or a digit) and normalized like a path. A topic created twice raises `AlreadyExistsError` |
 | `get_topic_writer(name)` | The `TopicWriter` already opened with `topic_create`. Raises if there is none |
 | `finish()` · `abort(reason)` | Finalize, or end the session per the policy |
 | `session_locator` | The session on the server, as `sequence:id` |
@@ -166,21 +170,21 @@ A write session: a new sequence (`sequence_create`) or new topics in an existing
 
 ### TopicWriter · public
 
-Writes one topic. Created by `topic_create`, lives as long as its session. `push` and its builder live in each language; `push_batch` is where data enters the core, the same in every language.
+Writes one topic. Created by `topic_create`, lives as long as its session. Rows are buffered in the core for every ontology: through a builder for the types written by hand, as Arrow rows (`push_row`) for the others. `push_batch` hands whole batches to the core directly.
 
 | Member | What it does |
 |---|---|
-| `push(msg)` | Adds a row to the topic's builder; sends it when it reaches about 1 MiB or a flush policy limit. Same timestamp order as `push_batch`; a row too large alone is dropped and notified (`RecordTooLarge`), as in today's SDK |
-| `push_batch(batch)` | Sends what the builder holds first, then the batch. Small batches are joined up to the server limit; a batch that fills it alone goes without copies. `timestamp_ns` must not decrease, within the batch or from the previous push. Python copies the batch at import, so the caller can reuse its buffers |
-| `push_stream(reader)` | Writes a whole Arrow stream, batch by batch |
-| `flush()` | Sends what the builder and the joined batches hold; `finish()` does it too |
-| `set_flush_policy(policy)` | When joined data is sent: bytes (default, up to the server limit), rows or age, checked at each push |
+| `push(msg)` | Adds a row to the topic's buffer in the core; sends it when it reaches about 1 MiB or a flush policy limit. Same timestamp order as `push_batch`; a row too large alone is dropped and notified (`RecordTooLarge`), as in today's SDK |
+| `push_batch(batch)` | Sends what the buffer holds first, then the batch. Small batches are joined up to the server limit; a batch that fills it alone goes without copies. `timestamp_ns` must not decrease, within the batch or from the previous push. Python copies the batch at import, so the caller can reuse its buffers |
+| `push_stream(stream)` | Writes a whole Arrow stream, batch by batch. In Rust it takes an async `Stream` of batches |
+| `flush()` | Sends what the buffer and the joined batches hold; `finish()` does it too |
+| `set_flush_policy(policy)` | When joined data is sent: bytes (default, up to the server limit), rows or age, checked at each push. The same for every ontology |
 | `reject(error)` | Applies the error policy to a push that failed before reaching the writer, such as a check in the binding, and returns the error |
-| `status` · `last_error` · `dropped_record_count` | Writer state |
+| `status` · `last_error` · `dropped_record_count` | Writer state. `RecordTooLarge` can also come later, when the `BatchWriter` drops a row at encoding |
 
 ### Streamers · public
 
-What a read returns. `get_data_streamer` gives messages, `get_batch_streamer` plain record batches. `to_arrow` and `to_pandas` read one to the end. Streams are independent. A stream closes at the end of the data, after an error, with `close()`, when dropped, or when its handler or client closes. Using it afterwards raises `StreamClosedError` (`ErrorKind::Closed` in Rust).
+What a read returns. `get_data_streamer` gives messages, `get_batch_streamer` plain record batches. `to_arrow` and `to_pandas` read one to the end. Streams are independent. At the end of the data a stream just ends, and further calls end again. After an error, `close()`, a drop, or when its handler or client closes, using it raises `StreamClosedError` (`ErrorKind::Closed` in Rust). `close()` also stops a stream that is still opening.
 
 | Member | What it does |
 |---|---|
@@ -188,7 +192,7 @@ What a read returns. `get_data_streamer` gives messages, `get_batch_streamer` pl
 | Arrow stream | The batch streamer is also an Arrow stream for DuckDB, Polars or C |
 | `close()` | Stops the request |
 
-### QueryResponse · public
+### QueryResponse · public · planned
 
 What `query()` returns: the matching sequences and their topics. It keeps a clone of the connection, so `clusterize` and `intersect` call the server directly. A query with no results is an empty response.
 
@@ -212,7 +216,7 @@ One `do_get`. A background task receives and decodes the batches into a bounded 
 
 ### MultiReader · internal
 
-Drives several `BatchReader`s. **merge**: K topics by timestamp, cut into windows of one slice per topic plus the row order; ties follow the topic order. **concat**: N parallel ranges of one topic, returned in order.
+Written but not used yet: multi-topic reads and parallel ranges are planned. Drives several `BatchReader`s. **merge**: K topics by timestamp, cut into windows of one slice per topic plus the row order; ties follow the topic order. **concat**: N parallel ranges of one topic, returned in order.
 
 | Member | What it does |
 |---|---|
@@ -234,7 +238,7 @@ The write lifecycle through `do_action`: create or update, add topics, finalize.
 
 ### BatchWriter · internal
 
-One `do_put` per topic, on its own connection so a topic the server is busy with does not hold back the others. Receives the batches of `push_batch` and knows no ontology type. Converts view columns (`Utf8View`, `BinaryView`) to plain ones, splits batches over the server limit read at connect, joins small ones up to it, and sends them in the background from a queue bounded in bytes, about two messages at the server limit. A single row over the limit is dropped and reported to the server. Local errors are raised at once; server errors at the next push or at finish.
+One `do_put` per topic, on its own connection so a topic the server is busy with does not hold back the others. Receives the batches of `push_batch` and knows no ontology type. Converts view columns (`Utf8View`, `BinaryView`) to plain ones, splits batches over the server limit read at connect, joins small ones up to it, and sends them in the background from a queue bounded in bytes, about two messages at the server limit, and by the client's write budget. The budget is shared by all the topics of a client: 512 MiB, or two messages at the server limit if that is larger. When it is full, every topic sends what it has joined so far instead of waiting to fill a message; below it nothing changes. A single row over the limit is dropped, reported to the server, and sets the topic status to `RecordTooLarge`. Local errors are raised at once; server errors at the next push or at finish.
 
 | Member | What it does |
 |---|---|
@@ -245,7 +249,7 @@ One `do_put` per topic, on its own connection so a topic the server is busy with
 
 ### Connection · internal
 
-One gRPC connection per client, plus one per topic being written: the five Flight calls, TLS, the API key header and gzip. Reads version and limits with `info` at connect and maps errors to categories.
+One gRPC connection per client, plus one per topic being written: the five Flight calls, TLS, the API key header and gzip, in both directions. Reads version and limits with `info` at connect, maps errors to categories and holds the client's write budget.
 
 | Member | What it does |
 |---|---|
@@ -253,6 +257,6 @@ One gRPC connection per client, plus one per topic being written: the five Fligh
 | `info()` | Server version and message size limits |
 | `get_flight_info(descriptor)` | Metadata and tickets |
 | `do_get(ticket)` · `do_put(descriptor)` | Batch streams |
-| `list_flights(criteria)` | A page of sequence names, with a cursor |
+| `list_flights(criteria)` | Every sequence name, in one response |
 | `do_action(name, body)` | Every other operation |
 

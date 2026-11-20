@@ -87,6 +87,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use tokio::sync::Semaphore;
 
+    use super::super::Permits;
     use super::*;
 
     fn pending(policy: FlushPolicy) -> Pending {
@@ -104,7 +105,10 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
         let values = Int64Array::from_iter_values(0..rows as i64);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(values)]).unwrap();
-        let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+        let permit = Permits {
+            _topic: Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+            _budget: Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+        };
         Queued {
             batch,
             bytes,

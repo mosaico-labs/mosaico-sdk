@@ -1,8 +1,10 @@
 use std::mem::ManuallyDrop;
 use std::pin::pin;
 use std::ptr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicPtr, Ordering};
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll, Wake, Waker};
+use std::thread::Thread;
 use std::time::Duration;
 
 use pyo3::prelude::*;
@@ -46,6 +48,34 @@ pub(crate) fn runtime() -> Result<&'static Runtime, String> {
     }
 }
 
+pub(crate) fn block_on<F: Future>(runtime: &Runtime, future: F) -> F::Output {
+    if tokio::runtime::Handle::try_current().is_err() {
+        return runtime.block_on(future);
+    }
+    let _context = runtime.enter();
+    let mut future = pin!(tokio::task::unconstrained(future));
+    let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    loop {
+        if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+            return output;
+        }
+        std::thread::park();
+    }
+}
+
+struct Unpark(Thread);
+
+impl Wake for Unpark {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.unpark();
+    }
+}
+
 pub(crate) fn wait<F>(py: Python<'_>, future: F) -> PyResult<F::Output>
 where
     F: Future + Send,
@@ -55,7 +85,7 @@ where
     let mut future = pin!(future);
     loop {
         let polled = py.detach(|| {
-            runtime.block_on(async {
+            block_on(runtime, async {
                 tokio::time::timeout(SIGNAL_CHECK_INTERVAL, future.as_mut()).await
             })
         });
@@ -86,7 +116,7 @@ where
     let mut signal = None;
     loop {
         let polled = py.detach(|| {
-            runtime.block_on(async {
+            block_on(runtime, async {
                 tokio::time::timeout(SIGNAL_CHECK_INTERVAL, future.as_mut()).await
             })
         });

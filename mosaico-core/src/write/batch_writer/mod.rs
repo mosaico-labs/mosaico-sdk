@@ -1,8 +1,9 @@
+mod budget;
 mod encoder;
 mod pending;
 mod schema;
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::pin::pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
@@ -10,24 +11,31 @@ use arrow_array::{Array, RecordBatch, make_array};
 use arrow_flight::{FlightData, FlightDescriptor, SchemaAsIpc};
 use arrow_ipc::writer::IpcWriteOptions;
 use arrow_schema::{DataType, Schema, SchemaRef};
+use futures::future::Either;
 use prost::Message;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::comm::action::ActionKind;
-use crate::comm::connection::Connection;
+use crate::comm::connection::{Connection, ServerInfo};
 use crate::comm::proto;
 use crate::error::{Error, ErrorKind, Result};
 use crate::scope::Token;
 use crate::write::session::{Interrupter, interrupted_error};
-use crate::write::topic::FlushPolicy;
+use crate::write::topic::{FlushPolicy, Status};
 
+pub(crate) use self::budget::WriteBudget;
 use self::encoder::{Encoder, ipc_compression, split};
 use self::pending::Pending;
 pub(crate) use self::schema::Conversion;
 use self::schema::{plain_schema, relabel, shape, shape_of, unmasked_nulls};
 
 const QUEUE_MESSAGES: usize = 2;
+
+fn limits(info: &ServerInfo) -> (usize, usize) {
+    let limit = usize::try_from(info.max_batch_size_bytes()).unwrap_or(usize::MAX);
+    (limit, limit.clamp(1, u32::MAX as usize / QUEUE_MESSAGES))
+}
 
 enum Input {
     Batch(Queued),
@@ -41,7 +49,12 @@ struct Queued {
     bytes: usize,
     since: Option<Instant>,
     urgent: bool,
-    permit: OwnedSemaphorePermit,
+    permit: Permits,
+}
+
+struct Permits {
+    _topic: OwnedSemaphorePermit,
+    _budget: OwnedSemaphorePermit,
 }
 
 enum Frame {
@@ -60,7 +73,7 @@ pub(crate) struct BatchWriter {
     record_limit: usize,
     queue: Queue,
     failure: Failure,
-    dropped: Arc<AtomicU64>,
+    status: Arc<Status>,
     interrupter: Interrupter,
     task: Option<JoinHandle<()>>,
 }
@@ -74,8 +87,7 @@ impl BatchWriter {
         token: Arc<Token>,
         interrupter: Interrupter,
     ) -> Result<Self> {
-        let limit = usize::try_from(connection.info().max_batch_size_bytes()).unwrap_or(usize::MAX);
-        let target_bytes = limit.clamp(1, u32::MAX as usize / QUEUE_MESSAGES);
+        let (limit, target_bytes) = limits(connection.info());
         let options = IpcWriteOptions::default()
             .try_with_compression(ipc_compression(connection.compression()))
             .map_err(|e| {
@@ -92,10 +104,12 @@ impl BatchWriter {
         let header =
             FlightData::from(SchemaAsIpc::new(&schema, &options)).with_descriptor(descriptor);
         let (input, receiver) = mpsc::unbounded_channel();
-        let queue = Queue::new(target_bytes);
+        let budget = connection.write_budget().clone();
+        let pressure = budget.pressure();
+        let queue = Queue::new(target_bytes, budget);
         let (frames, outgoing) = mpsc::channel(1);
         let failure = Failure::default();
-        let dropped = Arc::new(AtomicU64::new(0));
+        let status = Arc::new(Status::new());
         let encoding = Encoding {
             encoder: Arc::new(Encoder {
                 schema: schema.clone(),
@@ -106,7 +120,7 @@ impl BatchWriter {
             notifier: Notifier {
                 connection: connection.clone(),
                 locator,
-                dropped: dropped.clone(),
+                status: status.clone(),
             },
             interrupter: interrupter.clone(),
         };
@@ -118,7 +132,7 @@ impl BatchWriter {
             rows: 0,
             since: None,
         };
-        let encode = encode_loop(receiver, header, pending, encoding);
+        let encode = encode_loop(receiver, header, pending, encoding, Some(pressure));
         let upload = upload(connection.dedicated(), outgoing);
         let slot = failure.clone();
         let closing = queue.semaphore.clone();
@@ -150,7 +164,7 @@ impl BatchWriter {
             record_limit: limit,
             queue,
             failure,
-            dropped,
+            status,
             interrupter,
             task: Some(task),
         })
@@ -164,8 +178,8 @@ impl BatchWriter {
         self.record_limit
     }
 
-    pub(crate) fn dropped(&self) -> Arc<AtomicU64> {
-        self.dropped.clone()
+    pub(crate) fn status(&self) -> Arc<Status> {
+        self.status.clone()
     }
 
     pub(crate) fn interrupted(&self) -> bool {
@@ -256,13 +270,7 @@ impl BatchWriter {
                 conversion
             }
         };
-        for (column, field) in batch.columns().iter().zip(self.schema.fields()) {
-            if let Some(path) = unmasked_nulls(column.as_ref(), field, None) {
-                return Err(Error::schema(format!(
-                    "column '{path}' is not nullable but contains nulls"
-                )));
-            }
-        }
+        self.check_nulls(&batch)?;
         let schema = self.schema.clone();
         match conversion {
             Conversion::None => return Ok(batch),
@@ -290,6 +298,17 @@ impl BatchWriter {
         .await
         .map_err(|e| Error::new(ErrorKind::Stream, "conversion task failed").with_source(e))?
         .map_err(|e| Error::schema("cannot convert view columns").with_source(e))
+    }
+
+    pub(crate) fn check_nulls(&self, batch: &RecordBatch) -> Result<()> {
+        for (column, field) in batch.columns().iter().zip(self.schema.fields()) {
+            if let Some(path) = unmasked_nulls(column.as_ref(), field, None) {
+                return Err(Error::schema(format!(
+                    "column '{path}' is not nullable but contains nulls"
+                )));
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn check_shape(&self, schema: &Schema) -> Result<Conversion> {
@@ -351,39 +370,47 @@ impl Drop for BatchWriter {
 struct Queue {
     semaphore: Arc<Semaphore>,
     message: usize,
+    budget: Arc<WriteBudget>,
 }
 
 impl Queue {
-    fn new(message: usize) -> Self {
+    fn new(message: usize, budget: Arc<WriteBudget>) -> Self {
         Self {
             semaphore: Arc::new(Semaphore::new(message * QUEUE_MESSAGES)),
             message,
+            budget,
         }
     }
 
-    async fn acquire(&self, bytes: usize) -> Option<OwnedSemaphorePermit> {
+    async fn acquire(&self, bytes: usize) -> Option<Permits> {
         let permits = u32::try_from(bytes.clamp(1, self.message)).unwrap_or(u32::MAX);
-        self.semaphore
+        let topic = self
+            .semaphore
             .clone()
             .acquire_many_owned(permits)
             .await
-            .ok()
+            .ok()?;
+        let budget = self.budget.acquire(permits, &self.semaphore).await?;
+        Some(Permits {
+            _topic: topic,
+            _budget: budget,
+        })
     }
 }
 
 struct Notifier {
     connection: Connection,
     locator: String,
-    dropped: Arc<AtomicU64>,
+    status: Arc<Status>,
 }
 
 impl Notifier {
     async fn record_dropped(&self, count: u64) {
-        self.dropped.fetch_add(count, Ordering::Relaxed);
         let message = format!(
             "{count} record(s) dropped for topic '{}': a single record exceeds the message size limit",
             self.locator
         );
+        self.status.record_dropped(count, message.clone());
         let _ = self
             .connection
             .notify_error(ActionKind::TopicNotificationCreate, &self.locator, message)
@@ -427,16 +454,55 @@ impl Encoding {
     }
 }
 
+enum Event {
+    Input(Option<Input>),
+    Pressure,
+    PressureGone,
+}
+
+async fn next_event(
+    input: &mut mpsc::UnboundedReceiver<Input>,
+    pressure: Option<&mut watch::Receiver<u64>>,
+) -> Event {
+    let Some(pressure) = pressure else {
+        return Event::Input(input.recv().await);
+    };
+    let changed = pin!(pressure.changed());
+    let received = pin!(input.recv());
+    match futures::future::select(changed, received).await {
+        Either::Left((Ok(()), _)) => Event::Pressure,
+        Either::Left((Err(_), _)) => Event::PressureGone,
+        Either::Right((command, _)) => Event::Input(command),
+    }
+}
+
 async fn encode_loop(
     mut input: mpsc::UnboundedReceiver<Input>,
     header: FlightData,
     mut pending: Pending,
     encoding: Encoding,
+    mut pressure: Option<watch::Receiver<u64>>,
 ) -> Result<()> {
     if encoding.frames.send(Frame::Data(header)).await.is_err() {
         return Ok(());
     }
-    while let Some(command) = input.recv().await {
+    loop {
+        let command = match next_event(&mut input, pressure.as_mut()).await {
+            Event::Input(Some(command)) => command,
+            Event::Input(None) => break,
+            Event::PressureGone => {
+                pressure = None;
+                continue;
+            }
+            Event::Pressure => {
+                if let Some(group) = pending.take()
+                    && !encoding.send(group).await?
+                {
+                    return Ok(());
+                }
+                continue;
+            }
+        };
         let (ready, done, finish) = match command {
             Input::Batch(item) => (pending.add(item), None, false),
             Input::Flush(done) => (pending.take().into_iter().collect(), Some(done), false),
@@ -484,7 +550,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_item_never_waits_for_more_than_one_message() {
-        let queue = Queue::new(100);
+        let queue = Queue::new(100, Arc::new(WriteBudget::new(1000)));
         let _held = queue.acquire(99).await.unwrap();
         let large = tokio::time::timeout(Duration::from_secs(1), queue.acquire(10_000)).await;
         assert!(large.is_ok_and(|permit| permit.is_some()));

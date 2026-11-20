@@ -4,7 +4,7 @@ use arrow_schema::{DataType, SchemaRef};
 
 use crate::comm::connection::Connection;
 use crate::error::{Error, ErrorKind, Result};
-use crate::locator::topic_name;
+use crate::locator::{new_topic_name, topic_name};
 use crate::ontology::{Encode, Format};
 use crate::write::rows::record_schema;
 use crate::write::session::{Interrupter, Session, SessionErrorPolicy, interrupted_error};
@@ -66,7 +66,7 @@ impl SequenceWriter {
         metadata: Option<Vec<u8>>,
         on_error: TopicErrorPolicy,
     ) -> Result<TopicWriter> {
-        let name = topic_name(name);
+        let name = new_topic_name(name)?;
         if self.topics.iter().any(|topic| topic.name() == name) {
             return Err(Error::new(
                 ErrorKind::AlreadyExists,

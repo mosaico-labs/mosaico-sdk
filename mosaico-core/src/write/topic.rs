@@ -1,8 +1,9 @@
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StateLock, PoisonError};
+use std::sync::{Arc, Mutex as StateLock, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use arrow_array::{Array, Int64Array, RecordBatch, RecordBatchReader};
+use arrow_array::{Array, Int64Array, RecordBatch};
+use futures::{Stream, StreamExt};
 use tokio::sync::Mutex;
 
 use crate::comm::action::ActionKind;
@@ -10,7 +11,7 @@ use crate::comm::connection::Connection;
 use crate::error::{Error, ErrorKind, Result};
 use crate::ontology::Encode;
 use crate::write::batch_writer::BatchWriter;
-use crate::write::rows::{Chunk, Ready, RowBuffer, Rows};
+use crate::write::rows::{BatchRows, Chunk, Ready, RowBuffer, Rows};
 use crate::write::session::interrupted_error;
 
 pub(super) const TIMESTAMP: &str = "timestamp_ns";
@@ -55,15 +56,15 @@ impl TopicWriter {
     }
 
     pub fn dropped_records(&self) -> u64 {
-        self.topic.dropped.load(Ordering::Relaxed)
+        self.topic.status.dropped()
     }
 
     pub fn status(&self) -> TopicWriterStatus {
-        self.topic.state().status
+        self.topic.status.lock().status
     }
 
     pub fn last_error(&self) -> Option<String> {
-        self.topic.state().last_error.clone()
+        self.topic.status.lock().last_error.clone()
     }
 
     pub async fn push_batch(&self, batch: RecordBatch) -> Result<()> {
@@ -86,28 +87,14 @@ impl TopicWriter {
         result.map(drop)
     }
 
-    pub fn accepted(&self) {
-        let mut state = self.topic.state();
-        if !matches!(
-            state.status,
-            TopicWriterStatus::Finalized | TopicWriterStatus::FinalizedWithError
-        ) {
-            *state = State {
-                status: TopicWriterStatus::Active,
-                last_error: None,
-            };
-        }
-    }
-
-    pub async fn record_too_large(&self, size: usize) -> Result<()> {
-        let guard = self.topic.slot.lock().await;
-        let Some(slot) = guard.as_ref() else {
+    pub async fn push_row(&self, row: RecordBatch, size: usize) -> Result<()> {
+        let mut guard = self.topic.slot.lock().await;
+        let Some(slot) = guard.as_mut() else {
             return Err(self.topic.finalized());
         };
-        self.topic
-            .drop_record(size, slot.writer.record_limit())
-            .await;
-        Ok(())
+        let result = self.topic.push_row(slot, row, size).await;
+        self.topic.record(result.as_ref().map(|sent| *sent));
+        result.map(drop)
     }
 
     pub async fn reject(&self, error: Error) -> Error {
@@ -181,8 +168,13 @@ impl TopicWriter {
         }
     }
 
-    pub async fn push_stream(&self, reader: impl RecordBatchReader + Send) -> Result<()> {
-        for batch in reader {
+    pub async fn push_stream<S, E>(&self, batches: S) -> Result<()>
+    where
+        S: Stream<Item = std::result::Result<RecordBatch, E>>,
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        let mut batches = std::pin::pin!(batches);
+        while let Some(batch) = batches.next().await {
             let batch = batch.map_err(|e| {
                 Error::new(ErrorKind::InvalidArgument, "cannot read batch").with_source(e)
             })?;
@@ -211,15 +203,57 @@ pub(super) struct TopicState {
     locator: String,
     connection: Connection,
     on_error: TopicErrorPolicy,
-    dropped: Arc<AtomicU64>,
+    status: Arc<Status>,
     slot: Mutex<Option<Slot>>,
     last_timestamp: AtomicI64,
+}
+
+pub(crate) struct Status {
     state: StateLock<State>,
+    dropped: AtomicU64,
 }
 
 struct State {
     status: TopicWriterStatus,
     last_error: Option<String>,
+}
+
+impl Status {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: StateLock::new(State {
+                status: TopicWriterStatus::Active,
+                last_error: None,
+            }),
+            dropped: AtomicU64::new(0),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn set(&self, status: TopicWriterStatus, last_error: Option<String>) {
+        *self.lock() = State { status, last_error };
+    }
+
+    fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn record_dropped(&self, count: u64, message: String) {
+        self.dropped.fetch_add(count, Ordering::Relaxed);
+        let mut state = self.lock();
+        if !matches!(
+            state.status,
+            TopicWriterStatus::Finalized | TopicWriterStatus::FinalizedWithError
+        ) {
+            *state = State {
+                status: TopicWriterStatus::RecordTooLarge,
+                last_error: Some(message),
+            };
+        }
+    }
 }
 
 impl TopicState {
@@ -235,7 +269,7 @@ impl TopicState {
             locator,
             connection,
             on_error,
-            dropped: writer.dropped(),
+            status: writer.status(),
             slot: Mutex::new(Some(Slot {
                 writer,
                 rows: None,
@@ -243,10 +277,6 @@ impl TopicState {
                 policy: FlushPolicy::default(),
             })),
             last_timestamp: AtomicI64::new(i64::MIN),
-            state: StateLock::new(State {
-                status: TopicWriterStatus::Active,
-                last_error: None,
-            }),
         }
     }
 
@@ -261,12 +291,8 @@ impl TopicState {
         )
     }
 
-    fn state(&self) -> std::sync::MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
     pub(super) fn set_state(&self, status: TopicWriterStatus, last_error: Option<String>) {
-        *self.state() = State { status, last_error };
+        self.status.set(status, last_error);
     }
 
     fn record(&self, result: std::result::Result<bool, &Error>) {
@@ -348,6 +374,65 @@ impl TopicState {
         Ok(true)
     }
 
+    async fn push_row(&self, slot: &mut Slot, row: RecordBatch, size: usize) -> Result<bool> {
+        if slot.writer.interrupted() {
+            return Err(interrupted_error());
+        }
+        if row.num_rows() != 1 {
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
+                format!("expected one record, got {} rows", row.num_rows()),
+            ));
+        }
+        let Some((timestamp_ns, _)) = timestamp_range(&row)? else {
+            return Ok(false);
+        };
+        check_follows(
+            &self.name,
+            self.last_timestamp.load(Ordering::Relaxed),
+            timestamp_ns,
+        )?;
+        let limit = slot.writer.record_limit();
+        if size > limit {
+            self.drop_record(size, limit).await;
+            return Ok(false);
+        }
+        self.send_ready(slot).await?;
+        let schema = row.schema();
+        let other_schema = slot.rows.as_mut().is_some_and(|rows| {
+            !rows
+                .as_any()
+                .downcast_ref::<BatchRows>()
+                .is_some_and(|buffer| buffer.accepts(&schema))
+        });
+        if other_schema {
+            self.send_rows(slot, false).await?;
+            slot.rows = None;
+        }
+        if slot.rows.is_none() {
+            slot.writer.check_shape(&schema)?;
+        }
+        slot.writer.check_nulls(&row)?;
+        let rows = slot
+            .rows
+            .get_or_insert_with(|| Box::new(BatchRows::new(schema)));
+        let Some(buffer) = rows.as_any().downcast_mut::<BatchRows>() else {
+            return Err(Error::new(
+                ErrorKind::Stream,
+                "record buffer of another type",
+            ));
+        };
+        buffer.append(row, size);
+        self.last_timestamp.store(timestamp_ns, Ordering::Relaxed);
+        match rows.ready(&slot.policy, slot.writer.target_bytes()) {
+            Ready::No => {}
+            Ready::Chunk => slot.ready = rows.take(false)?,
+            Ready::Policy => slot.ready = rows.take(true)?,
+        }
+        self.send_ready(slot).await?;
+        Ok(true)
+    }
+
     async fn send_rows(&self, slot: &mut Slot, urgent: bool) -> Result<()> {
         self.send_ready(slot).await?;
         if let Some(rows) = slot.rows.as_mut() {
@@ -369,20 +454,15 @@ impl TopicState {
     }
 
     async fn drop_record(&self, size: usize, limit: usize) {
-        self.dropped.fetch_add(1, Ordering::Relaxed);
         let message = format!(
             "record dropped for topic '{}': its size ({size} bytes) exceeds the message size limit ({limit} bytes) and it cannot be split further",
             self.name
         );
+        self.status.record_dropped(1, message.clone());
         let _ = self
             .connection
-            .notify_error(
-                ActionKind::TopicNotificationCreate,
-                &self.locator,
-                message.clone(),
-            )
+            .notify_error(ActionKind::TopicNotificationCreate, &self.locator, message)
             .await;
-        self.set_state(TopicWriterStatus::RecordTooLarge, Some(message));
     }
 
     pub(super) async fn close(&self, close: Close<'_>) -> Result<()> {

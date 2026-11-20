@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import logging
 import threading
-import time
 from types import TracebackType
 from typing import Any
 
@@ -31,7 +30,6 @@ _RECORD_KINDS: dict[type[Serializable], str] = {
     Image: "image",
     CompressedImage: "compressed_image",
 }
-_CHUNK_BYTES = 1 << 20
 _log = logging.getLogger(__name__)
 
 
@@ -44,7 +42,7 @@ def _metadata(metadata: dict[str, Any] | None) -> bytes | None:
 
 
 def _topic_key(name: str) -> str:
-    return f"/{name.strip('/')}"
+    return "/" + "/".join(part for part in name.split("/") if part not in ("", "."))
 
 
 def _timestamps(value: Any) -> pa.Array:
@@ -109,14 +107,8 @@ class _SessionWriter:
         core = self._entered()
         try:
             if exc is None:
-                try:
-                    self._send_buffered()
-                except BaseException as e:
-                    self._abort(core, e)
-                    raise
                 self._finish(core)
                 return
-            self._drop_buffered()
             self._abort(core, exc)
         finally:
             if core.left_open:
@@ -128,18 +120,6 @@ class _SessionWriter:
             core.abort(str(exc) or type(exc).__name__, isinstance(exc, KeyboardInterrupt))
         except Exception as e:
             _log.error("cannot abort the write session of '%s': %s", self._name, e)
-
-    def _send_buffered(self) -> None:
-        for topic in self._topic_list():
-            topic.flush_buffer()
-
-    def _drop_buffered(self) -> None:
-        for topic in self._topic_list():
-            topic.drop_buffer()
-
-    def _topic_list(self) -> list[TopicWriter]:
-        with self._lock:
-            return list(self._topics.values())
 
     def _finish(self, core: _core.SequenceWriter) -> None:
         try:
@@ -185,7 +165,7 @@ class _SessionWriter:
                 _metadata(metadata),
                 policy.value,
             )
-            topic = TopicWriter(writer, ontology, schema, self._client.max_batch_size_bytes)
+            topic = TopicWriter(writer, ontology, schema)
             self._topics[writer.name] = topic
         return topic
 
@@ -240,43 +220,18 @@ class SequenceUpdater(_SessionWriter):
         return self._client.sequence_update(self._name, self._on_error.value)
 
 
-class _Rows:
-    def __init__(self) -> None:
-        self.batches: list[pa.RecordBatch] = []
-        self.bytes = 0
-        self.since: float | None = None
-
-    def add(self, row: pa.RecordBatch, size: int) -> None:
-        if self.since is None:
-            self.since = time.monotonic()
-        self.batches.append(row)
-        self.bytes += size
-
-    def take(self) -> list[pa.RecordBatch]:
-        batches, self.batches = self.batches, []
-        self.bytes = 0
-        self.since = None
-        return batches
-
-
 class TopicWriter:
     def __init__(
         self,
         core: _core.TopicWriter,
         ontology: type[Serializable],
         schema: pa.Schema,
-        record_limit: int,
     ) -> None:
         self._core = core
         self._ontology = ontology
         self._schema = schema
         self._payload = pa.schema(list(ontology.__msco_pyarrow_struct__))
         self._kind = _RECORD_KINDS.get(ontology)
-        self._record_limit = record_limit
-        self._lock = threading.Lock()
-        self._rows = _Rows()
-        self._policy: tuple[int | None, int | None, float | None] = (None, None, None)
-        self._last_timestamp: int | None = None
 
     def __enter__(self) -> TopicWriter:
         return self
@@ -290,13 +245,10 @@ class TopicWriter:
         if not isinstance(exc, Exception):
             return False
         try:
-            suppress = self._core.handle_error(str(exc) or type(exc).__name__)
+            return self._core.handle_error(str(exc) or type(exc).__name__)
         except Exception as e:
             _log.error("cannot apply the error policy of topic '%s': %s", self.name, e)
             return False
-        if self.status is TopicWriterStatus.FinalizedWithError:
-            self.drop_buffer()
-        return suppress
 
     @property
     def name(self) -> str:
@@ -334,74 +286,18 @@ class TopicWriter:
         if self._kind is not None:
             self._core.push(self._kind, message.timestamp_ns, data)
             return
-        with self._lock:
-            self._push_row(message)
-
-    def _push_row(self, message: Message) -> None:
-        if not self.is_active:
-            raise self._core.reject("the topic is finalized")
-        timestamp = message.timestamp_ns
-        last = self._last_timestamp
-        if last is not None and timestamp < last:
-            raise self._core.reject(
-                f"'timestamp_ns' must be non-decreasing across pushes on topic '{self.name}': "
-                f"got {timestamp}, lower than the last pushed timestamp {last}"
-            )
         try:
             row = pa.RecordBatch.from_pylist([message._encode()], schema=self._schema)
         except Exception as e:
             raise self._core.reject(f"cannot convert the message: {e}") from None
-        size = ipc.get_record_batch_size(row)
-        if size > self._record_limit:
-            self._core.record_too_large(size)
-            return
-        self._rows.add(row, size)
-        self._last_timestamp = timestamp
-        self._core.accepted()
-        if self._ready():
-            self._send_rows(urgent=self._urgent())
-
-    def _ready(self) -> bool:
-        max_bytes = self._policy[0]
-        limit = _CHUNK_BYTES if max_bytes is None else min(_CHUNK_BYTES, max_bytes)
-        return self._rows.bytes >= limit or self._urgent()
-
-    def _urgent(self) -> bool:
-        max_bytes, max_rows, max_age = self._policy
-        rows = self._rows
-        return bool(rows.batches) and (
-            (max_bytes is not None and rows.bytes >= max_bytes)
-            or (max_rows is not None and len(rows.batches) >= max_rows)
-            or (max_age is not None and rows.since is not None and time.monotonic() - rows.since >= max_age)
-        )
-
-    def _send_rows(self, urgent: bool = False) -> None:
-        batches = self._rows.take()
-        if not batches:
-            return
-        joined = pa.Table.from_batches(batches, schema=self._schema).combine_chunks()
-        self._core.push_batch(joined.to_batches()[0])
-        if urgent:
-            self._core.flush()
-
-    def flush_buffer(self) -> None:
-        with self._lock:
-            self._send_rows()
-
-    def drop_buffer(self) -> None:
-        with self._lock:
-            self._rows.take()
+        self._core.push_row(row, ipc.get_record_batch_size(row))
 
     def push_batch(self, timestamp_ns: pa.Array | Any, data: pa.RecordBatch) -> None:
         try:
             batch = self._wire_batch(timestamp_ns, data)
         except InvalidArgumentError as e:
             raise self._core.reject(str(e)) from None
-        with self._lock:
-            self._send_rows()
-            self._core.push_batch(batch)
-            if batch.num_rows > 0:
-                self._last_timestamp = batch.column(0)[-1].as_py()
+        self._core.push_batch(batch)
 
     def _wire_batch(self, timestamp_ns: object, data: object) -> pa.RecordBatch:
         if not isinstance(data, pa.RecordBatch):
@@ -417,18 +313,11 @@ class TopicWriter:
         return pa.RecordBatch.from_arrays(columns, names=[self._schema.names[0], *data.schema.names])
 
     def push_stream(self, stream: Any) -> None:
-        reader = pa.RecordBatchReader.from_stream(stream)
-        with self._lock:
-            self._send_rows()
-            for batch in reader:
-                self._core.push_batch(batch)
-                if batch.num_rows > 0:
-                    self._last_timestamp = batch.column(0)[-1].as_py()
+        for batch in pa.RecordBatchReader.from_stream(stream):
+            self._core.push_batch(batch)
 
     def flush(self) -> None:
-        with self._lock:
-            self._send_rows()
-            self._core.flush()
+        self._core.flush()
 
     def set_flush_policy(
         self,
@@ -436,8 +325,4 @@ class TopicWriter:
         max_rows: int | None = None,
         max_age: float | None = None,
     ) -> None:
-        with self._lock:
-            self._core.set_flush_policy(max_bytes, max_rows, max_age)
-            self._policy = (max_bytes, max_rows, max_age)
-            if self._urgent():
-                self._send_rows(urgent=True)
+        self._core.set_flush_policy(max_bytes, max_rows, max_age)

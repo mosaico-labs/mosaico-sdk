@@ -177,7 +177,7 @@ def test_topic_status(client: m.MosaicoClient, name: str) -> None:
         assert seq.list_topic_writers() == ["/imu"]
         with pytest.raises(m.TopicNotFoundError):
             seq.get_topic_writer("/other")
-        with pytest.raises(m.ServerError):
+        with pytest.raises(m.AlreadyExistsError):
             seq.topic_create("/imu", {}, IMU)
 
         backwards = pa.array([T0 + 2, T0 + 1], pa.int64())

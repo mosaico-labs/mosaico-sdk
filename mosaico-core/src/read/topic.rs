@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use arrow_array::RecordBatch;
 use arrow_flight::{FlightDescriptor, FlightEndpoint, FlightInfo, Ticket};
 use arrow_schema::SchemaRef;
@@ -11,7 +13,7 @@ use crate::ontology::Ontology;
 use crate::read::batch_reader::BatchReader;
 use crate::read::data_streamer::DataStreamer;
 use crate::read::streamer::BatchStreamer;
-use crate::scope::Scope;
+use crate::scope::{Scope, Token};
 
 #[derive(Clone)]
 pub struct TopicHandler {
@@ -114,6 +116,18 @@ impl TopicHandler {
     ) -> Result<BatchStreamer> {
         self.connection.ensure_open()?;
         let token = self.scope.token();
+        token
+            .run_until_closed(self.open_batches(start_ns, end_ns, token.clone()))
+            .await
+            .unwrap_or_else(|| Err(Error::new(ErrorKind::Closed, "stream closed")))
+    }
+
+    async fn open_batches(
+        &self,
+        start_ns: Option<i64>,
+        end_ns: Option<i64>,
+        token: Arc<Token>,
+    ) -> Result<BatchStreamer> {
         let locator = self.locator();
         let range = (start_ns.is_some() || end_ns.is_some())
             .then_some(proto::TimestampRange { start_ns, end_ns });

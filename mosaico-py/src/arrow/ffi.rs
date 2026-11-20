@@ -15,7 +15,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyCapsule, PyCapsuleMethods, PyTuple};
 
 use crate::errors::invalid;
-use crate::runtime::{ProcessBound, SIGNAL_CHECK_INTERVAL, runtime};
+use crate::runtime::{ProcessBound, SIGNAL_CHECK_INTERVAL, block_on, runtime};
 
 #[pyclass(frozen, module = "mosaico_rs._core")]
 pub(crate) struct SchemaHolder(pub(crate) SchemaRef);
@@ -369,8 +369,9 @@ fn next_blocking(
     };
     let mut next = pin!(streamer.next_batch());
     loop {
-        let polled = runtime
-            .block_on(async { tokio::time::timeout(SIGNAL_CHECK_INTERVAL, next.as_mut()).await });
+        let polled = block_on(runtime, async {
+            tokio::time::timeout(SIGNAL_CHECK_INTERVAL, next.as_mut()).await
+        });
         if let Ok(result) = polled {
             return result
                 .map_err(|e| ArrowError::ExternalError(Box::new(e)))
