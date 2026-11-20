@@ -46,7 +46,7 @@ The handler splits a time range into N parts and asks for one ticket per part. T
 
 1. `sequence_create()` or `sequence_update()` opens a write session with `do_action`.
 2. `topic_create()` creates the topic and opens its `BatchWriter` with `do_put`.
-3. `push` fills a builder on the language side and hands it to `push_batch` on a row, byte or time limit. `push_batch` is the only point where data enters the core.
+3. `push` appends the row to the topic's builder in the core and hands it to the `BatchWriter` at about 1 MiB, or earlier on the flush policy limits. Builders exist for the ontologies written by hand (IMU, Image, CompressedImage); in Python the other ontologies are buffered as in today's SDK and sent with `push_batch`. A row that alone exceeds the server limit is dropped, notified and counted, and the writer status becomes `RecordTooLarge`.
 4. The `BatchWriter` splits batches under the server limit and sends them in the background.
 5. Leaving the `with` block (or `finish()` in Rust) waits for the sends and finalizes the session. On error, the session policy deletes or reports it. Server errors surface at the next push or when the session finishes.
 
@@ -84,6 +84,9 @@ The Python package, rebuilt on the Rust core through PyO3. Calls are synchronous
 | `msg.get_data()` | Owned ontology object, a copy of the row |
 | `to_pandas(start, end)` | One DataFrame with dotted column names |
 | `MosaicoError` | Base class of every exception the SDK raises |
+| `image_from_linear_pixels(data, stride, height, width, encoding)` | Same signature as today's SDK; PNG is encoded in Rust without the GIL, same layout (8-bit gray, height × stride). A size mismatch raises instead of falling back to RAW |
+| `encode_png(data, height, stride)` · `encode_png_batch(batch)` | PNG of one buffer, or of every `raw` row of an `Image` batch on all cores, for `push_batch` |
+| `decode_png(data)` · `decode_png_batch(batch)` · `decode_png_table(table)` | Back to the raw bytes, as `to_linear_pixels` of today's SDK but returning `bytes`. The batch and table forms decode every `png` row and mark it `raw`; the table form decodes all its rows on all cores (the server sends images a row or two per batch). Every PNG type gives the same bytes as Pillow, which today's SDK uses (low bit depths expanded to one byte per pixel, 16-bit color to 8 bits). An invalid PNG raises instead of returning the data unchanged. `MOSAICO_PNG_THREADS` limits the threads of encoding and decoding |
 
 ### Rust SDK · public
 
@@ -99,8 +102,12 @@ The core crate itself, used directly by Rust programs. Async on tokio, with a bl
 | `blocking::MosaicoClient` | The same API without async |
 | `Error::kind()` | Connection, not found, invalid argument, schema, closed, server, … |
 | `RecordBatch` | arrow-rs batches, passed without conversion |
+| `encode_png_column(&[Pixels])` · `encode_png_batch(&batch)` | Raw images to the PNG `data` column of `Image`, on all cores: the layout of today's SDK (8-bit gray, height × stride). The batch form encodes only the `raw` rows. Behind the `png` feature |
+| `decode_png(&[u8])` · `decode_png_column` · `decode_png_batch` · `decode_png_batches(&[batch])` | PNG back to raw bytes, the same bytes as today's SDK; the batch forms decode the `png` rows on all cores. Behind the `png` feature |
+| `trait Encode` · `RecordBuilder` | Write side of an ontology: `FORMAT`, payload `fields()`, `size()` of a row and a builder that appends rows to Arrow columns. Written by hand for `Imu`, `Image`, `CompressedImage` |
+| `seq.topic_create_for::<Imu>(name, metadata, on_error)` · `topic.push(ts, &imu)` | Typed write: the topic schema comes from the type, rows go through the builder |
 | `RowRef` · `view::<T>()` | Multi-topic reads: one row of any topic, read as type `T`; `None` if the topic is not of type `T` |
-| `view.to_model()` · `msg.get_data()` | Owned copy of a typed view: an `ImuView` gives an `Imu` |
+| `view.to_model()` · `msg.to_model()` | Owned copy of a typed view: an `ImuView` gives an `Imu` |
 
 ### MosaicoClient · public
 
@@ -112,7 +119,9 @@ Entry point. Holds the single connection and reads the server version and limits
 | `sequence_handler(name)` | `SequenceHandler`. Raises if the sequence does not exist |
 | `topic_handler(sequence, topic, ontology=…)` | `TopicHandler`, checked against the ontology |
 | `sequence_create(name, metadata)` · `sequence_update(name)` | A write session, used in a `with` block |
-| `list_sequences()` · `sequence_delete(name)` · notifications | Lists through `list_flights`, a page at a time; the rest through `do_action` |
+| `list_sequences()` · `sequence_delete(name)` · `session_delete(locator)` | Lists through `list_flights`, a page at a time; deletes through `do_action` |
+| `sequence_exists(name)` · `topic_exists(sequence, topic)` | `False` only when the server answers not found; other errors raise |
+| `list_*_notifications(…)` · `clear_*_notifications(…)` | Notifications of a sequence or topic, such as dropped records or a failed session |
 | `query(…)` | Runs a query. Results grouped by sequence |
 | `close()` | Closes every stream of the client and its handlers. Permanent: later calls fail as closed |
 
@@ -125,7 +134,7 @@ One topic. Opening it reads the metadata once: ontology tag, time range and tick
 | `name` · `ontology_tag` · `timestamp_ns_min` · `timestamp_ns_max` | Metadata read at open |
 | `get_data_streamer(start, end)` | Messages in time order; `msg.data` is a view. The schema is checked when the stream opens. In Rust the type is a parameter: `get_data_streamer::<T>()` |
 | `get_batch_streamer(start, end)` | Plain Arrow record batches; also an Arrow stream that DuckDB, Polars or a C program read directly |
-| `to_arrow(start, end)` | One Arrow table, without copies. In Rust the schema and the batches |
+| `to_arrow(start, end)` | One Arrow table, without copies. In Rust the schema and the batches. Without data the schema is the same as with data: top-level strings and binaries as views, as mosaicod sends them |
 | `to_pandas(start, end)` | One DataFrame (Python only) |
 | `cancel=token` | Accepted by every read; cancelling stops the stream |
 | `close()` | Closes every stream opened from this handler and its clones. The handler stays usable |
@@ -144,14 +153,16 @@ One sequence. A single `get_flight_info` returns the metadata and the tickets of
 
 ### SequenceWriter · SequenceUpdater · public
 
-A write session: a new sequence (`sequence_create`) or new topics in an existing one (`sequence_update`). Same API; they differ only in how they open. In Python the `with` block finishes it, or applies the error policy on an exception. In Rust `finish()` is explicit, and dropping the session without it aborts.
+A write session: a new sequence (`sequence_create`) or new topics in an existing one (`sequence_update`). Same API; they differ only in how they open. In Python the `with` block finishes it, or applies the error policy on an exception. A Ctrl+C counts as an exception, also during the final `finish`: the session closes per the policy without sending what is still queued, and a second Ctrl+C leaves it open and logs its locator. In Rust `finish()` and `abort(reason)` are explicit. Dropping the writer without them cancels the topic streams, but the session stays open on the server.
 
 | Member | What it does |
 |---|---|
 | `topic_create(name, ontology, metadata, on_error)` | A `TopicWriter` for one topic |
 | `get_topic_writer(name)` | The `TopicWriter` already opened with `topic_create`. Raises if there is none |
-| `finish()` · `abort()` | Finalize, or end the session per the policy |
-| `status` | Session state |
+| `finish()` · `abort(reason)` | Finalize, or end the session per the policy |
+| `session_locator` | The session on the server, as `sequence:id` |
+| `interrupter()` | Rust: a handle whose `interrupt()` stops the session from another task. Topics drop what is not sent yet, `finish()` closes per the policy and returns `Closed` |
+| `status` | Session state. Python only: in Rust `finish()` and `abort()` take the writer and return the outcome |
 
 ### TopicWriter · public
 
@@ -159,10 +170,12 @@ Writes one topic. Created by `topic_create`, lives as long as its session. `push
 
 | Member | What it does |
 |---|---|
-| `push(msg)` | Adds a row to a builder generated from the ontology; sends it with `push_batch` when it reaches a row, byte or time limit |
-| `push_batch(batch)` | Sends what the builder holds first, then the batch as it is, without copies |
+| `push(msg)` | Adds a row to the topic's builder; sends it when it reaches about 1 MiB or a flush policy limit. Same timestamp order as `push_batch`; a row too large alone is dropped and notified (`RecordTooLarge`), as in today's SDK |
+| `push_batch(batch)` | Sends what the builder holds first, then the batch. Small batches are joined up to the server limit; a batch that fills it alone goes without copies. `timestamp_ns` must not decrease, within the batch or from the previous push. Python copies the batch at import, so the caller can reuse its buffers |
 | `push_stream(reader)` | Writes a whole Arrow stream, batch by batch |
-| `flush()` | Sends what the builder holds; `finish()` does it too |
+| `flush()` | Sends what the builder and the joined batches hold; `finish()` does it too |
+| `set_flush_policy(policy)` | When joined data is sent: bytes (default, up to the server limit), rows or age, checked at each push |
+| `reject(error)` | Applies the error policy to a push that failed before reaching the writer, such as a check in the binding, and returns the error |
 | `status` · `last_error` · `dropped_record_count` | Writer state |
 
 ### Streamers · public
@@ -210,28 +223,29 @@ Drives several `BatchReader`s. **merge**: K topics by timestamp, cut into window
 
 ### Session · internal
 
-The write lifecycle through `do_action`: create or update, add topics, finalize. On error it applies the policy: report or delete for the session; raise, finalize or ignore for a topic.
+The write lifecycle through `do_action`: create or update, add topics, finalize. On error it applies the session policy, report or delete. Topic policies (raise, finalize, ignore) live in `TopicWriter`.
 
 | Member | What it does |
 |---|---|
 | `create(sequence, metadata)` · `update(sequence)` | Opens the session |
-| `create_topic(name, tag, schema)` | Registers the topic and returns its `BatchWriter`. If the `do_put` fails to start, it deletes the topic |
-| `finish()` | Waits for every `BatchWriter`, then finalizes |
-| `abort()` | Applies the session policy |
+| `create_topic(name, tag, format, schema, metadata)` | Registers the topic and returns its `BatchWriter`. If the `BatchWriter` fails to open, it deletes the topic |
+| `finish()` | Finalizes the session; every topic must be finalized first |
+| `abort(reason)` | Report: notifies the sequence and finalizes. Delete: deletes the session, and the sequence if this session created it |
 
 ### BatchWriter · internal
 
-One `do_put` per topic. Receives the batches of `push_batch` and knows no ontology type. Splits batches under the server limit read at connect and sends them in the background from a bounded queue. Local errors are raised at once; server errors at the next push or at finish.
+One `do_put` per topic, on its own connection so a topic the server is busy with does not hold back the others. Receives the batches of `push_batch` and knows no ontology type. Converts view columns (`Utf8View`, `BinaryView`) to plain ones, splits batches over the server limit read at connect, joins small ones up to it, and sends them in the background from a queue bounded in bytes, about two messages at the server limit. A single row over the limit is dropped and reported to the server. Local errors are raised at once; server errors at the next push or at finish.
 
 | Member | What it does |
 |---|---|
 | `send(batch)` | Queues a batch; waits when the queue is full |
-| `flush()` | Waits until the queue is sent |
-| `finish()` | Closes the `do_put` and reports the first error |
+| `flush()` | Sends the joined batches now |
+| `finish()` | Ends the `do_put` cleanly, so the server finalizes the topic, and reports the first error |
+| drop | Without `finish()`, cancels the `do_put`: the topic is not finalized |
 
 ### Connection · internal
 
-One gRPC connection per client: the five Flight calls, TLS, the API key header and gzip. Reads version and limits with `info` at connect and maps errors to categories.
+One gRPC connection per client, plus one per topic being written: the five Flight calls, TLS, the API key header and gzip. Reads version and limits with `info` at connect and maps errors to categories.
 
 | Member | What it does |
 |---|---|
