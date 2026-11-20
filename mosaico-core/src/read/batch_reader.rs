@@ -9,7 +9,7 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::connection::Connection;
+use crate::comm::connection::Connection;
 use crate::error::{Error, ErrorKind, Result};
 use crate::scope::Token;
 

@@ -6,10 +6,20 @@ edition = "2024"
 [dependencies]
 arrow-array.workspace = true
 arrow-schema.workspace = true
+arrow-buffer.workspace = true
+arrow-cast.workspace = true
+arrow-data.workspace = true
 arrow-flight.workspace = true
 arrow-ipc.workspace = true
+arrow-select.workspace = true
 tonic.workspace = true
 prost.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["net"] }
 tokio-util.workspace = true
 futures.workspace = true
+http.workspace = true
+hyper-util.workspace = true
+tower.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util"] }

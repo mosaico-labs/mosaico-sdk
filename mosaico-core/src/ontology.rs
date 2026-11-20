@@ -1,6 +1,25 @@
-use arrow_array::RecordBatch;
+use arrow_array::{ArrayRef, RecordBatch};
+use arrow_schema::Fields;
 
 use crate::error::Result;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Format {
+    #[default]
+    Default,
+    Ragged,
+    Image,
+}
+
+impl Format {
+    pub(crate) fn to_proto(self) -> i32 {
+        match self {
+            Self::Default => 1,
+            Self::Ragged => 2,
+            Self::Image => 3,
+        }
+    }
+}
 
 pub trait Ontology: Sized + Send + Sync + 'static {
     const TAG: &'static str;
@@ -14,13 +33,26 @@ pub trait Ontology: Sized + Send + Sync + 'static {
     fn from_view(view: &Self::View<'_>) -> Result<Self>;
 }
 
+pub trait Encode: Ontology {
+    const FORMAT: Format;
+    type Builder: RecordBuilder<Self>;
+
+    fn fields() -> Fields;
+    fn size(&self) -> usize;
+}
+
+pub trait RecordBuilder<T>: Default + Send + 'static {
+    fn append(&mut self, value: &T);
+    fn finish(&mut self) -> Vec<ArrayRef>;
+}
+
 pub struct Message<'a, T: Ontology + 'a> {
     pub timestamp_ns: i64,
-    pub data: T::View<'a>,
+    pub view: T::View<'a>,
 }
 
 impl<'a, T: Ontology + 'a> Message<'a, T> {
-    pub fn get_data(&self) -> Result<T> {
-        T::from_view(&self.data)
+    pub fn to_model(&self) -> Result<T> {
+        T::from_view(&self.view)
     }
 }

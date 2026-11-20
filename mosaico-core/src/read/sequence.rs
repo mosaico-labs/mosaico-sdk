@@ -1,10 +1,11 @@
 use prost::Message;
 
-use crate::connection::Connection;
+use crate::comm::connection::Connection;
+use crate::comm::proto;
 use crate::error::{Error, ErrorKind, Result};
-use crate::proto;
+use crate::locator::{sequence_name, topic_name};
+use crate::read::topic::{TopicHandler, flight_info, topic_in_sequence};
 use crate::scope::Scope;
-use crate::topic::{TopicHandler, flight_info, sequence_name, topic_in_sequence, topic_name};
 
 #[derive(Debug, Clone)]
 pub struct SessionInfo {

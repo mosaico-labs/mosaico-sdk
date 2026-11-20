@@ -3,14 +3,15 @@ use arrow_flight::{FlightDescriptor, FlightEndpoint, FlightInfo, Ticket};
 use arrow_schema::SchemaRef;
 use prost::Message;
 
-use crate::batch_reader::BatchReader;
-use crate::connection::Connection;
-use crate::data_streamer::DataStreamer;
+use crate::comm::connection::Connection;
+use crate::comm::proto;
 use crate::error::{Error, ErrorKind, Result};
+use crate::locator::{sequence_name, topic_name};
 use crate::ontology::Ontology;
-use crate::proto;
+use crate::read::batch_reader::BatchReader;
+use crate::read::data_streamer::DataStreamer;
+use crate::read::streamer::BatchStreamer;
 use crate::scope::Scope;
-use crate::streamer::BatchStreamer;
 
 #[derive(Clone)]
 pub struct TopicHandler {
@@ -114,18 +115,11 @@ impl TopicHandler {
         self.connection.ensure_open()?;
         let token = self.scope.token();
         let locator = self.locator();
-        let ticket = match &self.ticket {
-            Some(ticket) => Some(ticket.clone()),
-            None => self.refetch(None).await?.ticket,
-        };
-        let ticket = match ticket {
-            Some(ticket) if start_ns.is_none() && end_ns.is_none() => Some(ticket),
-            Some(_) => {
-                self.refetch(Some(proto::TimestampRange { start_ns, end_ns }))
-                    .await?
-                    .ticket
-            }
-            None => None,
+        let range = (start_ns.is_some() || end_ns.is_some())
+            .then_some(proto::TimestampRange { start_ns, end_ns });
+        let ticket = match (&self.ticket, range) {
+            (Some(ticket), None) => Some(ticket.clone()),
+            (_, range) => self.refetch(range).await?.ticket,
         };
         let Some(ticket) = ticket else {
             return Ok(BatchStreamer::empty(token));
@@ -191,27 +185,12 @@ impl TopicHandler {
     }
 }
 
-pub(crate) fn topic_name(raw: &str) -> String {
-    format!("/{}", raw.trim_matches('/'))
-}
-
 pub(crate) fn topic_in_sequence(locator: &str, sequence: &str) -> Result<String> {
     locator
         .strip_prefix(sequence)
         .filter(|rest| rest.starts_with('/'))
         .map(str::to_owned)
         .ok_or_else(|| protocol(locator, &format!("not in sequence '{sequence}'")))
-}
-
-pub(crate) fn sequence_name(raw: &str) -> Result<&str> {
-    let name = raw.trim_matches('/');
-    if name.contains('/') {
-        return Err(Error::new(
-            ErrorKind::InvalidArgument,
-            format!("invalid sequence name '{raw}': '/' is not allowed"),
-        ));
-    }
-    Ok(name)
 }
 
 pub(crate) async fn flight_info(

@@ -53,8 +53,16 @@ impl Error {
         self
     }
 
+    pub(crate) fn duplicate(&self) -> Self {
+        Self::new(self.kind, self.to_string())
+    }
+
     pub fn schema(message: impl Into<String>) -> Self {
         Self::new(ErrorKind::Schema, message)
+    }
+
+    pub fn invalid_argument(message: impl Into<String>) -> Self {
+        Self::new(ErrorKind::InvalidArgument, message)
     }
 
     pub fn kind(&self) -> ErrorKind {

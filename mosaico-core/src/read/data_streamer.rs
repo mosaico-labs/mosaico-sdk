@@ -4,7 +4,7 @@ use arrow_array::{Array, Int64Array, RecordBatch};
 
 use crate::error::{Error, Result};
 use crate::ontology::{Message, Ontology};
-use crate::streamer::BatchStreamer;
+use crate::read::streamer::BatchStreamer;
 
 pub(crate) const TIMESTAMP_COLUMN: &str = "timestamp_ns";
 
@@ -59,7 +59,7 @@ impl<T: Ontology> DataStreamer<T> {
         current.row += 1;
         Ok(Some(Message {
             timestamp_ns: current.timestamps.value(row),
-            data: T::view(&current.columns, row),
+            view: T::view(&current.columns, row),
         }))
     }
 

@@ -1,7 +1,7 @@
 use arrow_array::RecordBatch;
 
-use crate::batch_reader::BatchReader;
 use crate::error::Result;
+use crate::read::batch_reader::BatchReader;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MergeLimits {

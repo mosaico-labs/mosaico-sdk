@@ -3,14 +3,27 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema, SchemaRef};
 
-use crate::batch_reader::BatchReader;
 use crate::error::{Error, ErrorKind, Result};
-use crate::multi_reader::MultiReader;
+use crate::read::batch_reader::BatchReader;
+use crate::read::multi_reader::MultiReader;
 use crate::scope::Token;
 
 enum Source {
     Single(BatchReader),
     Parallel(MultiReader),
+}
+
+#[derive(Clone)]
+pub struct CloseHandle(Arc<Token>);
+
+impl CloseHandle {
+    pub fn is_closed(&self) -> bool {
+        self.0.is_closed()
+    }
+
+    pub fn close(&self) {
+        self.0.close();
+    }
 }
 
 pub struct BatchStreamer {
@@ -42,6 +55,10 @@ impl BatchStreamer {
             source: Some(Source::Parallel(reader)),
             token,
         }
+    }
+
+    pub fn close_handle(&self) -> CloseHandle {
+        CloseHandle(self.token.clone())
     }
 
     pub fn schema(&self) -> &SchemaRef {
