@@ -1,18 +1,25 @@
 [workspace]
 resolver = "3"
-members = ["mosaico-core", "mosaico-ontology"]
+members = ["mosaico-core", "mosaico-ontology", "mosaico-py"]
 
 [workspace.dependencies]
 arrow-array = "58"
 arrow-schema = "58"
 arrow-buffer = "58"
+arrow-cast = "58"
 arrow-data = "58"
 arrow-flight = { version = "58", default-features = false }
-# Not used directly: enables decoding of the LZ4-compressed IPC that mosaicod sends
-arrow-ipc = { version = "58", features = ["lz4"] }
-tonic = { version = "0.14", default-features = false, features = ["channel", "tls-ring", "tls-native-roots"] }
+arrow-ipc = { version = "58", features = ["lz4", "zstd"] }
+arrow-select = "58"
+png = "0.18"
+rayon = "1"
+tonic = { version = "0.14", default-features = false, features = ["channel", "tls-ring", "tls-native-roots", "gzip"] }
 prost = "0.14"
 tokio = { version = "1", features = ["rt", "sync", "time"] }
 tokio-util = "0.7"
-futures = { version = "0.3", default-features = false }
+futures = { version = "0.3", default-features = false, features = ["alloc"] }
+http = "1"
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower = { version = "0.5", features = ["util"] }
 mosaico-core = { path = "mosaico-core" }
+pyo3 = "0.30"

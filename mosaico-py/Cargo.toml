@@ -1,0 +1,21 @@
+[package]
+name = "mosaico-py"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "_core"
+crate-type = ["cdylib"]
+test = false
+doctest = false
+
+[dependencies]
+mosaico-core.workspace = true
+mosaico-ontology = { path = "../mosaico-ontology", features = ["png"] }
+arrow-array = { workspace = true, features = ["ffi"] }
+arrow-buffer.workspace = true
+arrow-schema = { workspace = true, features = ["ffi"] }
+arrow-data = { workspace = true, features = ["ffi"] }
+pyo3.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }
