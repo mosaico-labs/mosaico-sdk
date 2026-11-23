@@ -95,7 +95,7 @@ impl BatchWriter {
             })?;
         let schema = plain_schema(&schema);
         let descriptor = FlightDescriptor::new_cmd(
-            proto::DoPutCmd {
+            proto::flight::DoPutCmd {
                 locator: locator.clone(),
                 topic_uuid,
             }

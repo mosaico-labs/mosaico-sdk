@@ -9,6 +9,8 @@ use arrow_flight::{
     HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
 };
 use futures::Stream;
+use mosaicod_proto::v1::requests::ResourceLocator;
+use mosaicod_proto::v1::responses::{ResourceUuid, ServerConfig, ServerInfo, SessionCreate};
 use prost::Message;
 use tonic::{Request, Response, Status, Streaming};
 
@@ -16,44 +18,6 @@ const MAX_DECODE: u64 = 50 * 1024 * 1024;
 const MAX_ENCODE: u64 = 4 * 1024 * 1024 * 1024 - 1;
 
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
-
-#[derive(Clone, PartialEq, prost::Message)]
-struct ServerConfig {
-    #[prost(uint64, tag = "1")]
-    grpc_max_decode_message_size: u64,
-    #[prost(uint64, tag = "2")]
-    grpc_max_encode_message_size: u64,
-    #[prost(uint64, tag = "3")]
-    grpc_target_encode_message_size: u64,
-}
-
-#[derive(Clone, PartialEq, prost::Message)]
-struct ServerInfo {
-    #[prost(string, tag = "1")]
-    version: String,
-    #[prost(message, optional, tag = "3")]
-    config: Option<ServerConfig>,
-}
-
-#[derive(Clone, PartialEq, prost::Message)]
-struct SessionCreate {
-    #[prost(string, tag = "1")]
-    uuid: String,
-    #[prost(string, tag = "2")]
-    locator: String,
-}
-
-#[derive(Clone, PartialEq, prost::Message)]
-struct ResourceUuid {
-    #[prost(string, tag = "1")]
-    uuid: String,
-}
-
-#[derive(Clone, PartialEq, prost::Message)]
-struct ResourceLocator {
-    #[prost(string, tag = "1")]
-    locator: String,
-}
 
 #[derive(Default)]
 struct Sink {
@@ -72,6 +36,7 @@ impl Sink {
         Ok(match action.r#type.as_str() {
             "info" => ServerInfo {
                 version: "0.0.0-sink".to_owned(),
+                semver: None,
                 config: Some(ServerConfig {
                     grpc_max_decode_message_size: MAX_DECODE,
                     grpc_max_encode_message_size: MAX_ENCODE,

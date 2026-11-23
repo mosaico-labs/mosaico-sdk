@@ -54,7 +54,7 @@ impl Session {
         policy: SessionErrorPolicy,
     ) -> Result<Self> {
         let sequence = new_sequence_name(sequence)?.to_owned();
-        let request = proto::SequenceCreate {
+        let request = proto::requests::SequenceCreate {
             locator: sequence.clone(),
             user_metadata: metadata.unwrap_or_default(),
         };
@@ -64,7 +64,7 @@ impl Session {
         match Self::open(connection, sequence.clone(), policy, true).await {
             Ok(session) => Ok(session),
             Err(error) => {
-                let request = proto::ResourceLocator { locator: sequence };
+                let request = proto::requests::ResourceLocator { locator: sequence };
                 let _ = connection
                     .action_empty(ActionKind::SequenceDelete, &request)
                     .await;
@@ -88,10 +88,10 @@ impl Session {
         policy: SessionErrorPolicy,
         owns_sequence: bool,
     ) -> Result<Self> {
-        let request = proto::ResourceLocator {
+        let request = proto::requests::ResourceLocator {
             locator: sequence.clone(),
         };
-        let created: proto::SessionCreate = connection
+        let created: proto::responses::SessionCreate = connection
             .action(ActionKind::SessionCreate, &request)
             .await?;
         Ok(Self {
@@ -135,14 +135,14 @@ impl Session {
         metadata: Option<Vec<u8>>,
     ) -> Result<BatchWriter> {
         let locator = format!("{}{}", self.sequence, topic_name(name));
-        let request = proto::TopicCreate {
+        let request = proto::requests::TopicCreate {
             locator: locator.clone(),
             session_uuid: self.uuid.clone(),
             serialization_format: format.to_proto(),
             ontology_tag: ontology_tag.to_owned(),
             user_metadata: metadata.unwrap_or_default(),
         };
-        let created: proto::ResourceUuid = self
+        let created: proto::responses::ResourceUuid = self
             .connection
             .action(ActionKind::TopicCreate, &request)
             .await?;
@@ -156,7 +156,7 @@ impl Session {
         ) {
             Ok(writer) => Ok(writer),
             Err(error) => {
-                let request = proto::ResourceLocator { locator };
+                let request = proto::requests::ResourceLocator { locator };
                 let _ = self
                     .connection
                     .action_empty(ActionKind::TopicDelete, &request)
@@ -185,7 +185,7 @@ impl Session {
                 reported.and(finalized)
             }
             SessionErrorPolicy::Delete => {
-                let request = proto::ResourceLocator {
+                let request = proto::requests::ResourceLocator {
                     locator: self.locator.clone(),
                 };
                 let deleted = self
@@ -195,7 +195,7 @@ impl Session {
                 if !self.owns_sequence {
                     return deleted;
                 }
-                let request = proto::ResourceLocator {
+                let request = proto::requests::ResourceLocator {
                     locator: self.sequence.clone(),
                 };
                 let removed = self
@@ -208,7 +208,7 @@ impl Session {
     }
 
     pub(crate) async fn finish(&self) -> Result<()> {
-        let request = proto::SessionUuid {
+        let request = proto::requests::SessionUuid {
             session_uuid: self.uuid.clone(),
         };
         self.connection

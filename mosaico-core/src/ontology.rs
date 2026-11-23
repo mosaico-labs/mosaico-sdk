@@ -1,6 +1,7 @@
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::Fields;
 
+use crate::comm::proto;
 use crate::error::Result;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -13,11 +14,12 @@ pub enum Format {
 
 impl Format {
     pub(crate) fn to_proto(self) -> i32 {
-        match self {
-            Self::Default => 1,
-            Self::Ragged => 2,
-            Self::Image => 3,
-        }
+        let format = match self {
+            Self::Default => proto::core::Format::Default,
+            Self::Ragged => proto::core::Format::Ragged,
+            Self::Image => proto::core::Format::Image,
+        };
+        format as i32
     }
 }
 

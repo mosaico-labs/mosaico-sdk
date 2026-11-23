@@ -21,7 +21,7 @@ pub struct Notification {
 }
 
 impl Notification {
-    fn from_proto(item: proto::NotificationItem) -> Self {
+    fn from_proto(item: proto::responses::NotificationItem) -> Self {
         let name = item.name.trim_matches('/');
         let (sequence, topic) = match name.split_once('/') {
             Some((sequence, topic)) => (sequence.to_owned(), Some(topic_name(topic))),
@@ -82,9 +82,11 @@ impl MosaicoClient {
     }
 
     pub async fn list_sequences(&self) -> Result<Vec<String>> {
-        let request = proto::ListFlightsCmd {
+        let request = proto::flight::ListFlightsCmd {
             limit: 0,
-            order_by: Some(proto::SEQUENCE_ORDER_CREATED_AT),
+            start: Some(proto::flight::list_flights_cmd::Start::OrderBy(
+                proto::flight::SequenceOrder::CreatedAt as i32,
+            )),
         };
         let criteria = Criteria {
             expression: request.encode_to_vec().into(),
@@ -109,7 +111,7 @@ impl MosaicoClient {
     }
 
     pub async fn session_delete(&self, locator: &str) -> Result<()> {
-        let request = proto::ResourceLocator {
+        let request = proto::requests::ResourceLocator {
             locator: locator.to_owned(),
         };
         self.connection
@@ -162,9 +164,10 @@ impl MosaicoClient {
     async fn notifications(
         &self,
         action: ActionKind,
-        locator: proto::ResourceLocator,
+        locator: proto::requests::ResourceLocator,
     ) -> Result<Vec<Notification>> {
-        let list: proto::NotificationList = self.connection.action(action, &locator).await?;
+        let list: proto::responses::NotificationList =
+            self.connection.action(action, &locator).await?;
         Ok(list
             .notifications
             .into_iter()
@@ -173,14 +176,14 @@ impl MosaicoClient {
     }
 }
 
-fn sequence_locator(name: &str) -> Result<proto::ResourceLocator> {
-    Ok(proto::ResourceLocator {
+fn sequence_locator(name: &str) -> Result<proto::requests::ResourceLocator> {
+    Ok(proto::requests::ResourceLocator {
         locator: sequence_name(name)?.to_owned(),
     })
 }
 
-fn topic_locator(sequence: &str, topic: &str) -> Result<proto::ResourceLocator> {
-    Ok(proto::ResourceLocator {
+fn topic_locator(sequence: &str, topic: &str) -> Result<proto::requests::ResourceLocator> {
+    Ok(proto::requests::ResourceLocator {
         locator: format!("{}{}", sequence_name(sequence)?, topic_name(topic)),
     })
 }

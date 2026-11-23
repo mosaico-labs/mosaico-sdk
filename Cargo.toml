@@ -15,6 +15,7 @@ png = "0.18"
 rayon = "1"
 tonic = { version = "0.14", default-features = false, features = ["channel", "tls-ring", "tls-native-roots", "gzip"] }
 prost = "0.14"
+mosaicod-proto = { git = "https://github.com/mosaico-labs/mosaico", tag = "v0.8.0" }
 tokio = { version = "1", features = ["rt", "sync", "time"] }
 tokio-util = "0.7"
 futures = { version = "0.3", default-features = false, features = ["alloc"] }

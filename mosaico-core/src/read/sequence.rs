@@ -33,7 +33,7 @@ impl SequenceHandler {
         let info = flight_info(connection, name, None)
             .await
             .map_err(|e| e.or_not_found(|| format!("sequence '{name}' not found")))?;
-        let meta = proto::SequenceAppMetadata::decode(info.app_metadata).map_err(|e| {
+        let meta = proto::flight::SequenceAppMetadata::decode(info.app_metadata).map_err(|e| {
             Error::new(ErrorKind::Protocol, "invalid sequence metadata").with_source(e)
         })?;
         let user_metadata = if meta.user_metadata.is_empty() {

@@ -47,9 +47,9 @@ impl TopicHandler {
         sequence: &str,
         endpoint: &FlightEndpoint,
     ) -> Result<Self> {
-        let meta = proto::TopicAppMetadata::decode(endpoint.app_metadata.clone()).map_err(|e| {
-            Error::new(ErrorKind::Protocol, "invalid topic metadata").with_source(e)
-        })?;
+        let meta = proto::flight::TopicAppMetadata::decode(endpoint.app_metadata.clone()).map_err(
+            |e| Error::new(ErrorKind::Protocol, "invalid topic metadata").with_source(e),
+        )?;
         let name = topic_in_sequence(&meta.locator, sequence)?;
         let data_info = meta
             .data_info
@@ -75,7 +75,7 @@ impl TopicHandler {
         scope: Scope,
         sequence: &str,
         locator: &str,
-        range: Option<proto::TimestampRange>,
+        range: Option<proto::time::TimestampRange>,
     ) -> Result<Self> {
         let info = flight_info(connection, locator, range)
             .await
@@ -130,7 +130,7 @@ impl TopicHandler {
     ) -> Result<BatchStreamer> {
         let locator = self.locator();
         let range = (start_ns.is_some() || end_ns.is_some())
-            .then_some(proto::TimestampRange { start_ns, end_ns });
+            .then_some(proto::time::TimestampRange { start_ns, end_ns });
         let ticket = match (&self.ticket, range) {
             (Some(ticket), None) => Some(ticket.clone()),
             (_, range) => self.refetch(range).await?.ticket,
@@ -183,7 +183,7 @@ impl TopicHandler {
         self.scope.close();
     }
 
-    async fn refetch(&self, range: Option<proto::TimestampRange>) -> Result<Self> {
+    async fn refetch(&self, range: Option<proto::time::TimestampRange>) -> Result<Self> {
         Self::fetch(
             &self.connection,
             self.scope.clone(),
@@ -210,9 +210,9 @@ pub(crate) fn topic_in_sequence(locator: &str, sequence: &str) -> Result<String>
 pub(crate) async fn flight_info(
     connection: &Connection,
     locator: &str,
-    range: Option<proto::TimestampRange>,
+    range: Option<proto::time::TimestampRange>,
 ) -> Result<FlightInfo> {
-    let cmd = proto::GetFlightInfoCmd {
+    let cmd = proto::flight::GetFlightInfoCmd {
         locator: locator.to_owned(),
         timestamp_range: range,
     };

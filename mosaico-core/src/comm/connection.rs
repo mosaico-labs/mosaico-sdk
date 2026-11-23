@@ -278,7 +278,7 @@ impl Connection {
         locator: &str,
         msg: String,
     ) -> Result<()> {
-        let request = proto::NotificationCreate {
+        let request = proto::requests::NotificationCreate {
             locator: locator.to_owned(),
             notification_type: "error".to_owned(),
             msg,
@@ -303,7 +303,7 @@ async fn read_info(channel: &Channel, api_key: &ApiKey) -> Result<ServerInfo> {
     let body = bodies
         .first()
         .ok_or_else(|| Error::new(ErrorKind::Protocol, "empty info response"))?;
-    let info = proto::ServerInfo::decode(body.as_slice())
+    let info = proto::responses::ServerInfo::decode(body.as_slice())
         .map_err(|e| Error::new(ErrorKind::Protocol, "invalid info response").with_source(e))?;
     let config = info
         .config
