@@ -102,7 +102,7 @@ fn image_round_trip() -> Result<()> {
 }
 
 #[test]
-fn record_schema_starts_with_the_timestamp() {
+fn record_schema_timestamp_first() {
     let schema = record_schema::<Imu>();
     let names: Vec<_> = schema.fields().iter().map(|f| f.name().as_str()).collect();
     assert_eq!(

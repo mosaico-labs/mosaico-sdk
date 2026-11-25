@@ -399,7 +399,7 @@ mod tests {
     }
 
     #[test]
-    fn decodes_to_the_same_bytes_as_wide_grayscale() {
+    fn wide_grayscale_roundtrip() {
         let data = image(48, 64 * 3, 1);
         let encoded = encode_png(Pixels {
             data: &data,
@@ -459,7 +459,7 @@ mod tests {
     }
 
     #[test]
-    fn decoding_returns_the_encoded_pixels() {
+    fn decode_roundtrip() {
         let data = image(48, 192, 3);
         let encoded = encode_png(Pixels {
             data: &data,
@@ -522,7 +522,7 @@ mod tests {
     }
 
     #[test]
-    fn decoding_follows_pillow_for_other_depths() {
+    fn decode_depths_like_pillow() {
         let gray2 = encoded(ColorType::Grayscale, BitDepth::Two, 4, &[0b00_01_10_11]);
         assert_eq!(decode_png(&gray2).unwrap(), [0, 85, 170, 255]);
         let indexed4 = encoded(ColorType::Indexed, BitDepth::Four, 3, &[0x1f, 0x70]);
@@ -541,7 +541,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_data_that_does_not_match_the_size() {
+    fn rejects_size_mismatch() {
         let data = image(4, 10, 0);
         for (height, stride) in [(4, 11), (0, 10), (4, 0)] {
             let e = encode_png(Pixels {

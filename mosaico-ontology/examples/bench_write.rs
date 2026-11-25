@@ -370,33 +370,34 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let mut writer = client
         .sequence_create(sequence, None, SessionErrorPolicy::Delete)
         .await?;
-    let topic = writer
-        .topic_create(
-            kind.topic(),
-            kind.tag(),
-            kind.format(),
-            kind.schema(),
-            None,
-            TopicErrorPolicy::Raise,
-        )
-        .await?;
-
-    let mut start = 0;
-    while start < rows {
-        let n = batch.min(rows - start);
-        let data = generator.batch(start, n)?;
-        let pushed = Instant::now();
-        if let Err(e) = topic.push_batch(data).await {
-            let _ = writer.abort(&e.to_string()).await;
-            return Err(e.into());
+    let result = async {
+        let topic = writer
+            .topic_create(
+                kind.topic(),
+                kind.tag(),
+                kind.format(),
+                kind.schema(),
+                None,
+                TopicErrorPolicy::Raise,
+            )
+            .await?;
+        let mut start = 0;
+        while start < rows {
+            let n = batch.min(rows - start);
+            let data = generator
+                .batch(start, n)
+                .map_err(|e| mosaico_core::Error::invalid_argument(e.to_string()))?;
+            let pushed = Instant::now();
+            topic.push_batch(data).await?;
+            pushing += pushed.elapsed();
+            start += n;
+            eprint!("\r{start}/{rows}");
         }
-        pushing += pushed.elapsed();
-        start += n;
-        eprint!("\r{start}/{rows}");
+        Ok(topic.dropped_records())
     }
-    let dropped = topic.dropped_records();
+    .await;
     let finishing = Instant::now();
-    writer.finish().await?;
+    let dropped = writer.complete(result).await?;
     pushing += finishing.elapsed();
 
     let total = started.elapsed().as_secs_f64();
@@ -443,40 +444,40 @@ async fn run_multi(
     let mut writer = client
         .sequence_create(sequence, None, SessionErrorPolicy::Delete)
         .await?;
-    let mut tasks = Vec::new();
-    for (kind, name, rows, batch) in plan {
-        let topic = writer
-            .topic_create(
-                &name,
-                kind.tag(),
-                kind.format(),
-                kind.schema(),
-                None,
-                TopicErrorPolicy::Raise,
-            )
-            .await?;
-        tasks.push(tokio::spawn(async move {
-            let mut generator = Generator::new(kind, kind.defaults().2);
-            let mut start = 0;
-            while start < rows {
-                let n = batch.min(rows - start);
-                let data = generator.batch(start, n).map_err(|e| e.to_string())?;
-                topic.push_batch(data).await.map_err(|e| e.to_string())?;
-                start += n;
-            }
-            Ok::<(), String>(())
-        }));
-    }
-    for task in tasks {
-        let result = match task.await {
-            Ok(result) => result,
-            Err(e) => Err(e.to_string()),
-        };
-        if let Err(e) = result {
-            let _ = writer.abort(&e).await;
-            return Err(e.into());
+    let result = async {
+        let mut tasks = Vec::new();
+        for (kind, name, rows, batch) in plan {
+            let topic = writer
+                .topic_create(
+                    &name,
+                    kind.tag(),
+                    kind.format(),
+                    kind.schema(),
+                    None,
+                    TopicErrorPolicy::Raise,
+                )
+                .await?;
+            tasks.push(tokio::spawn(async move {
+                let mut generator = Generator::new(kind, kind.defaults().2);
+                let mut start = 0;
+                while start < rows {
+                    let n = batch.min(rows - start);
+                    let data = generator
+                        .batch(start, n)
+                        .map_err(|e| mosaico_core::Error::invalid_argument(e.to_string()))?;
+                    topic.push_batch(data).await?;
+                    start += n;
+                }
+                Ok::<(), mosaico_core::Error>(())
+            }));
         }
+        for task in tasks {
+            task.await
+                .map_err(|e| mosaico_core::Error::invalid_argument(e.to_string()))??;
+        }
+        Ok(())
     }
-    writer.finish().await?;
+    .await;
+    writer.complete(result).await?;
     Ok(())
 }

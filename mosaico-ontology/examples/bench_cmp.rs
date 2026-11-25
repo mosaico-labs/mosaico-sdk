@@ -165,29 +165,34 @@ async fn write(
     let mut seq = client
         .sequence_create(&sequence, None, SessionErrorPolicy::Delete)
         .await?;
-    let writer = seq
-        .topic_create(
-            topic,
-            tag,
-            format,
-            table.schema(),
-            None,
-            TopicErrorPolicy::Raise,
-        )
-        .await?;
-    let mut data_bytes = 0;
-    for batch in batches {
-        let batch = match png {
-            true => {
-                let (batch, bytes) = png_batch(&batch)?;
-                data_bytes += bytes;
-                batch
-            }
-            false => batch,
-        };
-        writer.push_batch(batch).await?;
+    let result = async {
+        let writer = seq
+            .topic_create(
+                topic,
+                tag,
+                format,
+                table.schema(),
+                None,
+                TopicErrorPolicy::Raise,
+            )
+            .await?;
+        let mut data_bytes = 0;
+        for batch in batches {
+            let batch = match png {
+                true => {
+                    let (batch, bytes) = png_batch(&batch)
+                        .map_err(|e| mosaico_core::Error::invalid_argument(e.to_string()))?;
+                    data_bytes += bytes;
+                    batch
+                }
+                false => batch,
+            };
+            writer.push_batch(batch).await?;
+        }
+        Ok(data_bytes)
     }
-    seq.finish().await?;
+    .await;
+    let data_bytes = seq.complete(result).await?;
     let secs = started.elapsed().as_secs_f64();
     let cpu = cpu_secs() - cpu;
     Ok(format!(
@@ -223,13 +228,17 @@ async fn write_push<T: Encode>(kind_name: &str, rows: usize) -> Result<String, B
     let mut seq = client
         .sequence_create(&sequence, None, SessionErrorPolicy::Delete)
         .await?;
-    let writer = seq
-        .topic_create_for::<T>(topic, None, TopicErrorPolicy::Raise)
-        .await?;
-    for (timestamp_ns, value) in &messages {
-        writer.push(*timestamp_ns, value).await?;
+    let result = async {
+        let writer = seq
+            .topic_create_for::<T>(topic, None, TopicErrorPolicy::Raise)
+            .await?;
+        for (timestamp_ns, value) in &messages {
+            writer.push(*timestamp_ns, value).await?;
+        }
+        Ok(())
     }
-    seq.finish().await?;
+    .await;
+    seq.complete(result).await?;
     let secs = started.elapsed().as_secs_f64();
     let cpu = cpu_secs() - cpu;
     Ok(format!(
@@ -261,43 +270,48 @@ async fn write_multi(variant: &str) -> Result<String, Box<dyn Error>> {
     let mut seq = client
         .sequence_create(&sequence, None, SessionErrorPolicy::Delete)
         .await?;
-    let mut work = Vec::new();
-    for (topic, tag, format, schema, batches) in plans {
-        let writer = seq
-            .topic_create(&topic, tag, format, schema, None, TopicErrorPolicy::Raise)
-            .await?;
-        work.push((writer, batches));
-    }
-    if variant == "rust-tasks" {
-        let tasks: Vec<_> = work
-            .into_iter()
-            .map(|(writer, batches)| {
-                tokio::spawn(async move {
-                    for batch in batches {
+    let result = async {
+        let mut work = Vec::new();
+        for (topic, tag, format, schema, batches) in plans {
+            let writer = seq
+                .topic_create(&topic, tag, format, schema, None, TopicErrorPolicy::Raise)
+                .await?;
+            work.push((writer, batches));
+        }
+        if variant == "rust-tasks" {
+            let tasks: Vec<_> = work
+                .into_iter()
+                .map(|(writer, batches)| {
+                    tokio::spawn(async move {
+                        for batch in batches {
+                            writer.push_batch(batch).await?;
+                        }
+                        Ok::<_, mosaico_core::Error>(())
+                    })
+                })
+                .collect();
+            for task in tasks {
+                task.await
+                    .map_err(|e| mosaico_core::Error::invalid_argument(e.to_string()))??;
+            }
+        } else {
+            let steps = work.iter().map(|(_, b)| b.len()).max().unwrap_or(0);
+            let mut queues: Vec<_> = work
+                .into_iter()
+                .map(|(writer, batches)| (writer, batches.into_iter()))
+                .collect();
+            for _ in 0..steps {
+                for (writer, batches) in queues.iter_mut() {
+                    if let Some(batch) = batches.next() {
                         writer.push_batch(batch).await?;
                     }
-                    Ok::<_, mosaico_core::Error>(())
-                })
-            })
-            .collect();
-        for task in tasks {
-            task.await??;
-        }
-    } else {
-        let steps = work.iter().map(|(_, b)| b.len()).max().unwrap_or(0);
-        let mut queues: Vec<_> = work
-            .into_iter()
-            .map(|(writer, batches)| (writer, batches.into_iter()))
-            .collect();
-        for _ in 0..steps {
-            for (writer, batches) in queues.iter_mut() {
-                if let Some(batch) = batches.next() {
-                    writer.push_batch(batch).await?;
                 }
             }
         }
+        Ok(())
     }
-    seq.finish().await?;
+    .await;
+    seq.complete(result).await?;
     let secs = started.elapsed().as_secs_f64();
     let cpu = cpu_secs() - cpu;
     Ok(format!(
