@@ -21,11 +21,11 @@ Parts marked *planned* are designed but not in the code yet: multi-topic reads a
 ![Topic read](docs/diagrams/topic-read.svg)
 
 1. `topic_handler()` calls `get_flight_info` once and keeps the metadata and the ticket.
-2. A read with no time range reuses that ticket. A read with a range asks for the ticket of that window first.
+2. A read with no time range reuses that ticket. A read with a range asks for the ticket of that window first. A topic that had no data at open has no ticket, so each of its reads asks for one again: data written since then is read, but `timestamp_ns_min/max` keep the values read at open.
 3. The `BatchReader` runs `do_get` and decodes batches in the background.
 4. The user gets messages (views), record batches, one Arrow table or one DataFrame.
 
-A topic with no data gives an empty stream. Reads are independent: several can run at once on the same topic. Ranges include the start and exclude the end.
+A topic with no data gives an empty stream. Reads are independent: several can run at once on the same topic. Ranges include the start and exclude the end; either bound can be left out. A range whose start is not before its end is refused by mosaicod (`InvalidArgumentError`), as in today's SDK. In Python a bound that is not an int64 raises `InvalidArgumentError` before any call.
 
 ### Multi-topic read · planned
 
@@ -82,7 +82,7 @@ The Python package, rebuilt on the Rust core through PyO3. Calls are synchronous
 | Member | What it does |
 |---|---|
 | `msg.data` | Read-only view of one row, generated in Python. A field is read only when accessed |
-| `msg.data` (type without generated code) | Open: a generic view built at runtime from the topic schema, with the same access and no static types |
+| `msg.data` (type without generated code) | *Planned*: a generic view built at runtime from the topic schema, with the same access and no static types. Today Python reads messages only for `IMU`; `get_data_streamer` on another ontology raises `NotImplementedError` and points to `get_batch_streamer()` and `to_arrow()`. Rust reads `Imu`, `Image` and `CompressedImage` as messages |
 | `msg.get_data()` | Owned ontology object, a copy of the row |
 | `to_pandas(start, end)` | One DataFrame with dotted column names |
 | `MosaicoError` | Base class of every exception the SDK raises. Subclasses by cause: `ConnectError` (also a `ConnectionError`), `SequenceNotFoundError` (also from a write session whose sequence or session is gone), `TopicNotFoundError`, `InvalidArgumentError`, `SchemaError` and `StreamClosedError` (also `ValueError`), `AlreadyExistsError`, `PermissionDeniedError` (missing or wrong API key, also a `PermissionError`), `OntologyMismatchError`, `StreamError`, and `ServerError` for the rest |
@@ -139,7 +139,7 @@ One topic. Opening it reads the metadata once: ontology tag, time range and tick
 | `name` · `ontology_tag` · `timestamp_ns_min` · `timestamp_ns_max` | Metadata read at open |
 | `get_data_streamer(start, end)` | Messages in time order; `msg.data` is a view. The schema is checked when the stream opens. In Rust the type is a parameter: `get_data_streamer::<T>()` |
 | `get_batch_streamer(start, end)` | Plain Arrow record batches; also an Arrow stream that DuckDB, Polars or a C program read directly |
-| `to_arrow(start, end)` | One Arrow table, without copies. In Rust the schema and the batches. Without data the schema is the same as with data: top-level strings and binaries as views, as mosaicod sends them |
+| `to_arrow(start, end)` | One Arrow table, without copies. In Rust the schema and the batches. In Python a read without data has the same schema as one with data: top-level strings and binaries as views, as mosaicod sends them. In Rust it has an empty schema, also from `get_batch_streamer`, since the core knows the schema only from the stream |
 | `to_pandas(start, end)` | One DataFrame (Python only) |
 | `cancel=token` | *Planned.* Accepted by every read; cancelling stops the stream |
 | `close()` | Closes every stream opened from this handler and its clones. The handler stays usable |
@@ -151,7 +151,7 @@ One sequence. A single `get_flight_info` returns the metadata and the tickets of
 | Member | What it does |
 |---|---|
 | `topics` · `sessions` · `user_metadata` · `timestamp_ns_min/max` | Metadata read at open |
-| `topic_handler(topic, ontology=…)` | `TopicHandler` built from the saved ticket |
+| `topic_handler(topic, ontology=…)` | `TopicHandler` built from the saved ticket, checked against the ontology as `client.topic_handler`. Same name as on the client, in Python and Rust (where it takes no ontology); today's SDK calls it `get_topic_handler` |
 | `get_data_streamer(topics, start, end)` | *Planned.* `(TopicHandler, msg)` in global time order. In Rust `msg` is a `RowRef` |
 | `update(on_error)` | Python only: `SequenceUpdater` for this sequence, as in today's SDK. Rust uses `client.sequence_update(name, on_error)` |
 | `close()` | Closes the streams of all its topic handlers. The handler stays usable |
