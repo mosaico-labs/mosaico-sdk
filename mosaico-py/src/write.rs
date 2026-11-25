@@ -2,14 +2,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as SchemaLock, PoisonError};
 
 use mosaico_core::{
-    Encode, Error, ErrorKind, FlushPolicy, Format, Interrupter, TopicErrorPolicy, TopicWriterStatus,
+    Encode, Error, FlushPolicy, Format, Interrupter, TopicErrorPolicy, TopicWriterStatus,
 };
 use pyo3::exceptions::PyBaseException;
 use pyo3::prelude::*;
 use tokio::sync::Mutex;
 
 use crate::arrow::ffi::{Imported, KnownSchema, import_batch, import_schema};
-use crate::errors::{MosaicoError, StreamClosedError, invalid, parse_seconds, to_py};
+use crate::errors::{
+    MosaicoError, StreamClosedError, invalid, parse_seconds, sequence_error, to_py,
+};
 use crate::record;
 use crate::runtime::{Closing, ProcessBound, run, run_now, wait, wait_closing};
 
@@ -38,16 +40,25 @@ impl SequenceWriter {
         py: Python<'_>,
         closing: Closing<Option<mosaico_core::Result<()>>>,
     ) -> PyResult<Option<PyErr>> {
+        let left_open = |result: &mosaico_core::Result<()>| {
+            if result.as_ref().is_err_and(Error::left_open) {
+                self.left_open.store(true, Ordering::Relaxed);
+            }
+        };
         match closing {
-            Closing::Done(result) => result.ok_or_else(ended)?.map(|()| None).map_err(to_py),
-            Closing::Interrupted(result, signal) => match result.ok_or_else(ended)? {
-                Ok(()) => Ok(Some(signal)),
-                Err(error) if error.kind() == ErrorKind::Closed => Err(signal),
-                Err(error) => {
-                    signal.set_cause(py, Some(to_py(error)));
-                    Err(signal)
+            Closing::Done(result) => {
+                let result = result.ok_or_else(ended)?;
+                left_open(&result);
+                result.map(|()| None).map_err(sequence_error)
+            }
+            Closing::Interrupted(result, signal) => {
+                let result = result.ok_or_else(ended)?;
+                left_open(&result);
+                match result {
+                    Ok(()) => Ok(Some(signal)),
+                    Err(error) => Err(interrupted(py, signal, sequence_error(error))),
                 }
-            },
+            }
             Closing::Abandoned(signal) => {
                 self.left_open.store(true, Ordering::Relaxed);
                 Err(signal)
@@ -58,6 +69,13 @@ impl SequenceWriter {
 
 fn ended() -> PyErr {
     StreamClosedError::new_err("the write session has already ended")
+}
+
+fn interrupted(py: Python<'_>, signal: PyErr, error: PyErr) -> PyErr {
+    if !error.is_instance_of::<StreamClosedError>(py) {
+        signal.set_cause(py, Some(error));
+    }
+    signal
 }
 
 fn push_value<T: Encode>(
@@ -138,19 +156,28 @@ impl SequenceWriter {
         };
         let schema = import_schema(schema)?;
         let inner = self.inner.get()?;
-        let writer = wait(py, async {
-            match inner.lock().await.as_mut() {
-                Some(writer) => Some(
-                    writer
-                        .topic_create(name, ontology_tag, format, schema, metadata, on_error)
-                        .await,
-                ),
-                None => None,
+        let created = wait_closing(
+            py,
+            async {
+                match inner.lock().await.as_mut() {
+                    Some(writer) => Some(
+                        writer
+                            .topic_create(name, ontology_tag, format, schema, metadata, on_error)
+                            .await,
+                    ),
+                    None => None,
+                }
+            },
+            &self.interrupter,
+        )?;
+        let writer = match created {
+            Closing::Done(created) => created.ok_or_else(ended)?.map_err(sequence_error)?,
+            Closing::Interrupted(Some(Err(error)), signal) => {
+                return Err(interrupted(py, signal, sequence_error(error)));
             }
-        })?
-        .ok_or_else(ended)?
-        .map_err(to_py)?;
-        Ok(TopicWriter::new(writer))
+            Closing::Interrupted(_, signal) | Closing::Abandoned(signal) => return Err(signal),
+        };
+        Ok(TopicWriter::new(writer, self.interrupter.clone()))
     }
 
     fn get_topic_writer(&self, py: Python<'_>, name: &str) -> PyResult<TopicWriter> {
@@ -164,7 +191,7 @@ impl SequenceWriter {
         })?
         .ok_or_else(ended)?
         .map_err(to_py)?;
-        Ok(TopicWriter::new(writer))
+        Ok(TopicWriter::new(writer, self.interrupter.clone()))
     }
 
     fn finish(&self, py: Python<'_>) -> PyResult<Option<Py<PyBaseException>>> {
@@ -178,7 +205,7 @@ impl SequenceWriter {
                     None => None,
                 }
             },
-            || self.interrupter.interrupt(),
+            &self.interrupter,
         )?;
         Ok(self
             .closed(py, closing)?
@@ -200,7 +227,7 @@ impl SequenceWriter {
                     None => None,
                 }
             },
-            || self.interrupter.interrupt(),
+            &self.interrupter,
         )?;
         match self.closed(py, closing)? {
             Some(signal) => Err(signal),
@@ -213,11 +240,16 @@ impl SequenceWriter {
 pub(crate) struct TopicWriter(
     ProcessBound<mosaico_core::TopicWriter>,
     SchemaLock<Option<Arc<KnownSchema>>>,
+    Interrupter,
 );
 
 impl TopicWriter {
-    fn new(writer: mosaico_core::TopicWriter) -> Self {
-        Self(ProcessBound::new(writer), SchemaLock::new(None))
+    fn new(writer: mosaico_core::TopicWriter, interrupter: Interrupter) -> Self {
+        Self(
+            ProcessBound::new(writer),
+            SchemaLock::new(None),
+            interrupter,
+        )
     }
 
     fn known_schema(&self) -> std::sync::MutexGuard<'_, Option<Arc<KnownSchema>>> {
@@ -275,12 +307,12 @@ impl TopicWriter {
         })
     }
 
-    fn push_row(&self, py: Python<'_>, row: &Bound<'_, PyAny>, size: usize) -> PyResult<()> {
+    fn push_row(&self, py: Python<'_>, row: &Bound<'_, PyAny>) -> PyResult<()> {
         let writer = self.0.get()?;
         let row = self.import(row);
         run_now(py, async {
             match row.and_then(Imported::owned) {
-                Ok(row) => writer.push_row(row, size).await,
+                Ok(row) => writer.push_row(row).await,
                 Err(message) => Err(writer.reject(Error::invalid_argument(message)).await),
             }
         })
@@ -306,7 +338,21 @@ impl TopicWriter {
 
     fn handle_error(&self, py: Python<'_>, reason: &str) -> PyResult<bool> {
         let writer = self.0.get()?;
-        wait(py, writer.handle_error(reason))
+        match wait_closing(py, writer.handle_error(reason), &self.2)? {
+            Closing::Done(result) => result.map_err(to_py),
+            Closing::Interrupted(Err(error), signal) => Err(interrupted(py, signal, to_py(error))),
+            Closing::Interrupted(Ok(_), signal) | Closing::Abandoned(signal) => Err(signal),
+        }
+    }
+
+    #[pyo3(signature = (error = None))]
+    fn finalize(&self, py: Python<'_>, error: Option<&str>) -> PyResult<()> {
+        let writer = self.0.get()?;
+        match wait_closing(py, writer.finalize(error), &self.2)? {
+            Closing::Done(result) => result.map_err(to_py),
+            Closing::Interrupted(Err(error), signal) => Err(interrupted(py, signal, to_py(error))),
+            Closing::Interrupted(Ok(()), signal) | Closing::Abandoned(signal) => Err(signal),
+        }
     }
 
     fn reject(&self, py: Python<'_>, message: &str) -> PyResult<Py<PyBaseException>> {
@@ -328,11 +374,10 @@ impl TopicWriter {
         max_rows: Option<i64>,
         max_age: Option<f64>,
     ) -> PyResult<()> {
-        let policy = FlushPolicy {
-            max_bytes: count("max_bytes", max_bytes)?,
-            max_rows: count("max_rows", max_rows)?,
-            max_age: max_age.map(|s| parse_seconds("max_age", s)).transpose()?,
-        };
+        let mut policy = FlushPolicy::default();
+        policy.max_bytes = count("max_bytes", max_bytes)?;
+        policy.max_rows = count("max_rows", max_rows)?;
+        policy.max_age = max_age.map(|s| parse_seconds("max_age", s)).transpose()?;
         let writer = self.0.get()?;
         run(py, writer.set_flush_policy(policy))
     }

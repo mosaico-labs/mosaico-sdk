@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import logging
+import operator
 import threading
+from collections.abc import Iterator
 from types import TracebackType
 from typing import Any
 
 import pyarrow as pa
-import pyarrow.ipc as ipc
 from mosaicolabs import (
     IMU,
     CompressedImage,
@@ -30,6 +31,8 @@ _RECORD_KINDS: dict[type[Serializable], str] = {
     Image: "image",
     CompressedImage: "compressed_image",
 }
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
 _log = logging.getLogger(__name__)
 
 
@@ -56,6 +59,13 @@ def _timestamps(value: Any) -> pa.Array:
     if array.type != pa.int64():
         raise InvalidArgumentError(f"'timestamp_ns' must be int64, got '{array.type}'")
     return array
+
+
+def _is_int64(value: Any) -> bool:
+    try:
+        return _INT64_MIN <= operator.index(value) <= _INT64_MAX
+    except TypeError:
+        return False
 
 
 class _SessionWriter:
@@ -111,6 +121,10 @@ class _SessionWriter:
                 return
             self._abort(core, exc)
         finally:
+            with self._lock:
+                topics = list(self._topics.values())
+            for topic in topics:
+                topic._warn_dropped()
             if core.left_open:
                 _log.error("the write session '%s' was left open on the server%s", self._locator, self._cleanup())
 
@@ -232,6 +246,7 @@ class TopicWriter:
         self._schema = schema
         self._payload = pa.schema(list(ontology.__msco_pyarrow_struct__))
         self._kind = _RECORD_KINDS.get(ontology)
+        self._dropped_warned = False
 
     def __enter__(self) -> TopicWriter:
         return self
@@ -283,14 +298,17 @@ class TopicWriter:
             raise self._core.reject(
                 f"message data is {type(data).__name__}, but topic '{self.name}' stores {self._ontology.__name__}"
             )
+        timestamp = message.timestamp_ns
+        if not _is_int64(timestamp):
+            raise self._core.reject(f"'timestamp_ns' must be an int64, got {timestamp!r}")
         if self._kind is not None:
-            self._core.push(self._kind, message.timestamp_ns, data)
+            self._core.push(self._kind, timestamp, data)
             return
         try:
             row = pa.RecordBatch.from_pylist([message._encode()], schema=self._schema)
         except Exception as e:
             raise self._core.reject(f"cannot convert the message: {e}") from None
-        self._core.push_row(row, ipc.get_record_batch_size(row))
+        self._core.push_row(row)
 
     def push_batch(self, timestamp_ns: pa.Array | Any, data: pa.RecordBatch) -> None:
         try:
@@ -313,8 +331,43 @@ class TopicWriter:
         return pa.RecordBatch.from_arrays(columns, names=[self._schema.names[0], *data.schema.names])
 
     def push_stream(self, stream: Any) -> None:
-        for batch in pa.RecordBatchReader.from_stream(stream):
+        if not hasattr(stream, "__arrow_c_stream__"):
+            kind = type(stream)
+            raise self._core.reject(
+                f"stream must be an Arrow stream (with __arrow_c_stream__), not {kind.__module__}.{kind.__qualname__}"
+            )
+        for batch in self._read_stream(stream):
             self._core.push_batch(batch)
+
+    def _read_stream(self, stream: Any) -> Iterator[pa.RecordBatch]:
+        try:
+            yield from pa.RecordBatchReader.from_stream(stream)
+        except Exception as e:
+            self._core.reject(str(e) or type(e).__name__)
+            raise
+
+    def finalize(self, error: BaseException | None = None) -> None:
+        try:
+            self._core.finalize(None if error is None else str(error) or type(error).__name__)
+        finally:
+            self._warn_dropped()
+
+    def _warn_dropped(self) -> None:
+        if self._dropped_warned:
+            return
+        try:
+            dropped = self._core.dropped_records
+        except Exception:
+            return
+        if dropped:
+            self._dropped_warned = True
+            _log.warning(
+                "topic '%s': %d records dropped, each larger alone than the server's message size limit",
+                self.name,
+                dropped,
+            )
+
+    _finalize = finalize
 
     def flush(self) -> None:
         self._core.flush()

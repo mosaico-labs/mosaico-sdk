@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import logging
 from typing import Any, TypeVar
 
 from mosaicolabs import GRPCCompression, GRPCCompressionAlgorithm, Serializable, SessionLevelErrorPolicy
@@ -13,13 +14,18 @@ from ._writer import SequenceUpdater, SequenceWriter
 
 T = TypeVar("T", bound=Serializable)
 
+_log = logging.getLogger(__name__)
+
 
 def _compression(value: object) -> str | None:
     if isinstance(value, GRPCCompression):
         value = value.algorithm
     if value is None or value == GRPCCompressionAlgorithm.Null:
         return None
-    if value in (GRPCCompressionAlgorithm.Gzip, GRPCCompressionAlgorithm.StreamGzip):
+    if value == GRPCCompressionAlgorithm.StreamGzip:
+        _log.warning("StreamGzip compression is not supported: the connection is not compressed")
+        return None
+    if value == GRPCCompressionAlgorithm.Gzip:
         return "gzip"
     if value in ("lz4", "zstd", "gzip"):
         return str(value)

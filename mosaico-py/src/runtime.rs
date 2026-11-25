@@ -7,6 +7,7 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::thread::Thread;
 use std::time::Duration;
 
+use mosaico_core::Interrupter;
 use pyo3::prelude::*;
 use tokio::runtime::Runtime;
 
@@ -105,7 +106,7 @@ pub(crate) enum Closing<T> {
 pub(crate) fn wait_closing<F>(
     py: Python<'_>,
     future: F,
-    interrupt: impl Fn(),
+    interrupter: &Interrupter,
 ) -> PyResult<Closing<F::Output>>
 where
     F: Future + Send,
@@ -127,10 +128,10 @@ where
             });
         }
         if let Err(error) = py.check_signals() {
-            if signal.is_some() {
+            if interrupter.interrupted() {
                 return Ok(Closing::Abandoned(error));
             }
-            interrupt();
+            interrupter.interrupt();
             signal = Some(error);
         }
     }
