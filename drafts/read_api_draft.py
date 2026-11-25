@@ -1,4 +1,4 @@
-from mosaicolabs import MosaicoClient, QueryOntologyCatalog, IMU
+from mosaicolabs import IMU, CompressedImage, MosaicoClient
 
 with MosaicoClient.connect("localhost", 6726) as client:
     seq = client.sequence_handler("mission_alpha")
@@ -20,19 +20,15 @@ with MosaicoClient.connect("localhost", 6726) as client:
 
     df = imu.to_pandas(start_timestamp_ns=t0, end_timestamp_ns=t1)
 
-   # -------------------------------------------------------------
-
-#   for topic, msg in seq.get_data_streamer(topics=["/gps", "/front/imu"]):
-#       ...
-#
-#   """
-#   4. query
-#   """
-#   found = client.query(QueryOntologyCatalog(IMU.Q.acceleration.z.gt(15.0)))
-#   if found is None:
-#       raise RuntimeError("query failed")
-#   for item in found:
-#       for topic in item.topics:
-#           for cluster in topic.clusterize(clustering_dt_ns=int(1e9)):
-#               for msg in topic.get_data_streamer(timestamp_range=cluster.timerange):
-#                   ...
+    cam = seq.topic_handler("/front/camera", ontology_type=CompressedImage)
+    frames = []
+    last_z = None
+    with seq.get_data_streamer(topics=[imu, cam, "/rear/imu"], start_timestamp_ns=t0, end_timestamp_ns=t1) as stream:
+        print(stream.msg_count, stream.next_timestamp())
+        for topic, msg in stream:
+            if topic is imu:
+                last_z = msg.data.acceleration.z
+            elif topic is cam:
+                frames.append((msg.timestamp_ns, last_z, msg.data.format))
+            else:
+                print(f"[{topic}] {msg.timestamp_ns}")
