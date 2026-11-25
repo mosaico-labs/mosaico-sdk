@@ -130,7 +130,7 @@ mod tests {
     }
 
     #[test]
-    fn age_counts_from_the_oldest_row() {
+    fn age_from_oldest() {
         let mut pending = pending(FlushPolicy {
             max_age: Some(Duration::from_secs(60)),
             ..FlushPolicy::default()
@@ -147,7 +147,7 @@ mod tests {
     }
 
     #[test]
-    fn joins_until_the_byte_target() {
+    fn joins_to_target() {
         let mut pending = pending(FlushPolicy::default());
         assert!(pending.add(queued(1, 40)).is_empty());
         assert!(pending.add(queued(1, 40)).is_empty());
@@ -176,7 +176,7 @@ mod tests {
     }
 
     #[test]
-    fn max_rows_limits_the_group() {
+    fn max_rows_limit() {
         let mut pending = pending(FlushPolicy {
             max_rows: Some(5),
             ..FlushPolicy::default()
@@ -197,7 +197,7 @@ mod tests {
     }
 
     #[test]
-    fn max_age_is_checked_at_push() {
+    fn age_checked_at_push() {
         let mut pending = pending(FlushPolicy {
             max_age: Some(Duration::from_millis(20)),
             ..FlushPolicy::default()

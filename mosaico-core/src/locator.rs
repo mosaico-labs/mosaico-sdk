@@ -1,6 +1,6 @@
 use crate::error::{Error, ErrorKind, Result};
 
-pub(crate) fn topic_name(raw: &str) -> String {
+pub fn topic_name(raw: &str) -> String {
     let parts: Vec<&str> = raw
         .split('/')
         .filter(|part| !part.is_empty() && *part != ".")

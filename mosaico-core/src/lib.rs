@@ -10,6 +10,7 @@ mod write;
 pub use client::{MosaicoClient, Notification};
 pub use comm::connection::{Compression, ConnectOptions, ServerInfo};
 pub use error::{Error, ErrorKind, Result};
+pub use locator::topic_name;
 pub use ontology::{Encode, Format, Message, Ontology, RecordBuilder};
 pub use read::data_streamer::DataStreamer;
 pub use read::sequence::{SequenceHandler, SessionInfo};

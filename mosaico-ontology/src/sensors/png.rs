@@ -412,7 +412,7 @@ mod tests {
     }
 
     #[test]
-    fn column_keeps_the_input_order() {
+    fn column_keeps_order() {
         let images: Vec<Vec<u8>> = (0..17).map(|seed| image(20, 30, seed)).collect();
         let pixels: Vec<Pixels> = images
             .iter()

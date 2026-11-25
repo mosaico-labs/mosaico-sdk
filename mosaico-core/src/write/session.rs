@@ -11,10 +11,14 @@ use crate::ontology::Format;
 use crate::scope::{Scope, Token};
 use crate::write::topic::TopicState;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Interrupter(Arc<AtomicBool>);
 
 impl Interrupter {
+    pub(crate) fn new() -> Self {
+        Self(Arc::default())
+    }
+
     pub fn interrupt(&self) {
         self.0.store(true, Ordering::Relaxed);
     }
@@ -112,7 +116,7 @@ impl Session {
             policy,
             owns_sequence,
             has_topics: AtomicBool::new(false),
-            interrupter: Interrupter::default(),
+            interrupter: Interrupter::new(),
         })
     }
 
@@ -219,7 +223,7 @@ impl Session {
         let mut kept = topics.len();
         let mut waits = 0;
         loop {
-            let refusal = match self.finish().await {
+            let refusal = match self.send_finalize().await {
                 Ok(()) => return Ok(()),
                 Err(error) => error,
             };
@@ -273,7 +277,7 @@ impl Session {
             .await
     }
 
-    pub(crate) async fn finish(&self) -> Result<()> {
+    async fn send_finalize(&self) -> Result<()> {
         let request = proto::requests::SessionUuid {
             session_uuid: self.uuid.clone(),
         };
@@ -323,7 +327,7 @@ impl Session {
             policy,
             owns_sequence: true,
             has_topics: AtomicBool::new(false),
-            interrupter: Interrupter::default(),
+            interrupter: Interrupter::new(),
         }
     }
 }

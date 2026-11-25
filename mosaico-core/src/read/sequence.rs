@@ -8,6 +8,7 @@ use crate::read::topic::{TopicHandler, flight_info, topic_in_sequence};
 use crate::scope::Scope;
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SessionInfo {
     pub locator: String,
     pub created_at_ns: i64,

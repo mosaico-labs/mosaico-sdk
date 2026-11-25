@@ -303,8 +303,10 @@ impl BatchWriter {
         if let Some(input) = self.input.take() {
             let _ = input.send(Input::Finish);
         }
-        if let Some(task) = self.task.take() {
-            task.await.map_err(|e| {
+        if let Some(task) = self.task.as_mut() {
+            let joined = task.await;
+            self.task = None;
+            joined.map_err(|e| {
                 Error::new(ErrorKind::Stream, "topic writer task failed").with_source(e)
             })?;
         }
@@ -676,7 +678,7 @@ mod tests {
             unsent: VecDeque::new(),
             failure: Failure::default(),
             ended: Arc::new(AtomicBool::new(false)),
-            interrupter: Interrupter::default(),
+            interrupter: Interrupter::new(),
             task: None,
         };
         (writer, received)

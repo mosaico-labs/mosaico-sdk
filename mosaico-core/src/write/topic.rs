@@ -5,6 +5,7 @@ use std::time::Duration;
 use arrow_array::{Array, Int64Array, RecordBatch};
 use futures::{Stream, StreamExt};
 use tokio::sync::{Mutex, watch};
+use tokio::task::AbortHandle;
 
 use crate::comm::action::ActionKind;
 use crate::comm::budget::limits;
@@ -112,7 +113,7 @@ impl TopicWriter {
     pub async fn reject(&self, error: Error) -> Error {
         let guard = self.topic.slot.lock().await;
         if guard.is_none() {
-            return self.topic.finalized();
+            return self.topic.ended().await;
         }
         self.topic
             .set_state(TopicWriterStatus::Raised, Some(error.to_string()));
@@ -121,31 +122,27 @@ impl TopicWriter {
 
     pub async fn handle_error(&self, reason: &str) -> Result<bool> {
         let mut guard = self.topic.slot.lock().await;
+        if guard.is_none() {
+            let _ = self.topic.closed().await;
+            return Ok(self.topic.on_error == TopicErrorPolicy::Ignore);
+        }
         match self.topic.on_error {
             TopicErrorPolicy::Raise => {
-                if guard.is_some() {
-                    self.topic
-                        .set_state(TopicWriterStatus::Raised, Some(reason.to_owned()));
-                }
+                self.topic
+                    .set_state(TopicWriterStatus::Raised, Some(reason.to_owned()));
                 Ok(false)
             }
             TopicErrorPolicy::Ignore => {
-                if guard.is_some() {
-                    self.topic.reporter.report(reason).await;
-                    self.topic
-                        .set_state(TopicWriterStatus::IgnoredLastError, Some(reason.to_owned()));
-                }
+                self.topic.reporter.report(reason).await;
+                self.topic
+                    .set_state(TopicWriterStatus::IgnoredLastError, Some(reason.to_owned()));
                 Ok(true)
             }
-            TopicErrorPolicy::Finalize => {
-                if guard.is_none() {
-                    return Ok(false);
-                }
-                self.topic
-                    .close_slot(&mut guard, Close::Report(reason))
-                    .await
-                    .map(|()| true)
-            }
+            TopicErrorPolicy::Finalize => self
+                .topic
+                .close_slot(&mut guard, Close::Report(reason))
+                .await
+                .map(|()| true),
         }
     }
 
@@ -279,12 +276,13 @@ pub(super) struct TopicState {
 }
 
 struct Closing {
+    task: AbortHandle,
     done: watch::Receiver<bool>,
     outcome: Arc<StateLock<Option<Result<()>>>>,
     end_sent: Arc<AtomicBool>,
 }
 
-pub(crate) struct Status {
+struct Status {
     state: StateLock<State>,
     dropped: AtomicU64,
 }
@@ -295,7 +293,7 @@ struct State {
 }
 
 impl Status {
-    pub(crate) fn new() -> Self {
+    fn new() -> Self {
         Self {
             state: StateLock::new(State {
                 status: TopicWriterStatus::Active,
@@ -419,19 +417,36 @@ impl TopicState {
         let end_sent = writer.end_sent();
         let outcome = Arc::new(StateLock::new(None));
         let (finished, done) = watch::channel(false);
-        tokio::spawn({
+        let task = tokio::spawn({
             let outcome = outcome.clone();
             async move {
                 let result = writer.finish().await;
                 *outcome.lock().unwrap_or_else(PoisonError::into_inner) = Some(result);
                 finished.send_replace(true);
             }
-        });
+        })
+        .abort_handle();
         *self.closing.lock().unwrap_or_else(PoisonError::into_inner) = Some(Closing {
+            task,
             done,
             outcome,
             end_sent,
         });
+    }
+
+    fn discard_closing(&self, reason: &str) {
+        let closing = self
+            .closing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(closing) = closing {
+            closing.task.abort();
+            self.set_state(
+                TopicWriterStatus::FinalizedWithError,
+                Some(reason.to_owned()),
+            );
+        }
     }
 
     async fn closed(&self) -> Result<()> {
@@ -483,9 +498,19 @@ impl TopicState {
         Error::new(ErrorKind::Closed, message)
     }
 
+    async fn ended(&self) -> Error {
+        match self.closed().await {
+            Ok(()) => self.finalized(),
+            Err(error) => error,
+        }
+    }
+
     async fn open<'a>(&self, slot: &'a mut Option<Slot>) -> Result<&'a mut Slot> {
         if slot.as_ref().is_some_and(|open| open.writer.failed()) {
             return Err(self.fail(slot).await);
+        }
+        if slot.is_none() {
+            return Err(self.ended().await);
         }
         slot.as_mut().ok_or_else(|| self.finalized())
     }
@@ -502,15 +527,7 @@ impl TopicState {
         if let Some(open) = slot.take() {
             self.start_closing(open.writer);
         }
-        let error = match self.closed().await {
-            Ok(()) => return self.finalized(),
-            Err(error) => error,
-        };
-        self.set_state(
-            TopicWriterStatus::FinalizedWithError,
-            Some(error.to_string()),
-        );
-        error
+        self.ended().await
     }
 
     pub(super) fn set_state(&self, status: TopicWriterStatus, last_error: Option<String>) {
@@ -550,117 +567,118 @@ impl TopicState {
         timestamp_ns: i64,
         value: &T,
     ) -> Result<bool> {
-        if slot.writer.interrupted() {
-            return Err(interrupted_error());
-        }
-        check_follows(
-            &self.reporter.name,
-            self.last_timestamp.load(Ordering::Relaxed),
-            timestamp_ns,
-        )?;
-        let size = value.size();
-        if size > slot.writer.record_limit() {
-            self.reporter.record_dropped(1, size, true).await;
-            return Ok(false);
-        }
-        self.send_ready(slot).await?;
-        let other_type = slot
+        self.admit(slot, timestamp_ns)?;
+        let reuse = slot
             .rows
             .as_mut()
-            .is_some_and(|rows| !rows.as_any().is::<RowBuffer<T>>());
-        if other_type {
-            self.send_rows(slot, false).await?;
-            slot.rows = None;
-        }
-        let rows = match &mut slot.rows {
-            Some(rows) => rows,
-            None => {
-                if T::TAG != self.ontology_tag || T::FORMAT != self.format {
-                    return Err(Error::invalid_argument(format!(
-                        "topic '{}' stores {} ({:?}), not {} ({:?})",
-                        self.reporter.name,
-                        self.ontology_tag,
-                        self.format,
-                        T::TAG,
-                        T::FORMAT
-                    )));
-                }
-                let buffer = RowBuffer::<T>::new();
-                slot.writer.check_shape(buffer.schema())?;
-                slot.rows.insert(Box::new(buffer))
+            .is_some_and(|rows| rows.as_any().is::<RowBuffer<T>>());
+        let fresh: Option<Box<dyn Rows>> = if reuse {
+            None
+        } else {
+            if T::TAG != self.ontology_tag || T::FORMAT != self.format {
+                return Err(Error::invalid_argument(format!(
+                    "topic '{}' stores {} ({:?}), not {} ({:?})",
+                    self.reporter.name,
+                    self.ontology_tag,
+                    self.format,
+                    T::TAG,
+                    T::FORMAT
+                )));
             }
+            let buffer = RowBuffer::<T>::new();
+            slot.writer.check_shape(buffer.schema())?;
+            Some(Box::new(buffer))
         };
+        let size = value.size();
+        if !self.fits(slot.writer.record_limit(), size).await {
+            return Ok(false);
+        }
+        let rows = self.switch_rows(slot, fresh).await?;
         let Some(buffer) = rows.as_any().downcast_mut::<RowBuffer<T>>() else {
-            return Err(Error::new(
-                ErrorKind::Stream,
-                "record buffer of another type",
-            ));
+            return Err(other_buffer());
         };
         buffer.append(timestamp_ns, value, size);
-        self.last_timestamp.store(timestamp_ns, Ordering::Relaxed);
-        match rows.ready(&slot.policy, slot.writer.target_bytes()) {
-            Ready::No => {}
-            Ready::Chunk => slot.ready = rows.take(false)?,
-            Ready::Policy => slot.ready = rows.take(true)?,
-        }
-        self.send_ready(slot).await?;
-        Ok(true)
+        self.appended(slot, timestamp_ns).await
     }
 
     async fn push_row(&self, slot: &mut Slot, row: RecordBatch) -> Result<bool> {
-        if slot.writer.interrupted() {
-            return Err(interrupted_error());
-        }
         if row.num_rows() != 1 {
-            return Err(Error::new(
-                ErrorKind::InvalidArgument,
-                format!("expected one record, got {} rows", row.num_rows()),
-            ));
+            return Err(Error::invalid_argument(format!(
+                "expected one record, got {} rows",
+                row.num_rows()
+            )));
         }
         let Some((timestamp_ns, _)) = timestamp_range(&row)? else {
             return Ok(false);
         };
+        self.admit(slot, timestamp_ns)?;
+        let schema = row.schema();
+        let reuse = slot.rows.as_mut().is_some_and(|rows| {
+            rows.as_any()
+                .downcast_ref::<BatchRows>()
+                .is_some_and(|buffer| buffer.accepts(&schema))
+        });
+        let fresh: Option<Box<dyn Rows>> = if reuse {
+            None
+        } else {
+            slot.writer.check_shape(&schema)?;
+            Some(Box::new(BatchRows::new(schema)))
+        };
+        slot.writer.check_nulls(&row)?;
+        let size = estimate(&row);
+        if !self.fits(slot.writer.record_limit(), size).await {
+            return Ok(false);
+        }
+        let rows = self.switch_rows(slot, fresh).await?;
+        let Some(buffer) = rows.as_any().downcast_mut::<BatchRows>() else {
+            return Err(other_buffer());
+        };
+        buffer.append(row, size);
+        self.appended(slot, timestamp_ns).await
+    }
+
+    fn admit(&self, slot: &Slot, timestamp_ns: i64) -> Result<()> {
+        if slot.writer.interrupted() {
+            return Err(interrupted_error());
+        }
         check_follows(
             &self.reporter.name,
             self.last_timestamp.load(Ordering::Relaxed),
             timestamp_ns,
-        )?;
-        let size = estimate(&row);
-        if size > slot.writer.record_limit() {
-            self.reporter.record_dropped(1, size, true).await;
-            return Ok(false);
+        )
+    }
+
+    async fn fits(&self, limit: usize, size: usize) -> bool {
+        if size <= limit {
+            return true;
         }
+        self.reporter.record_dropped(1, size, true).await;
+        false
+    }
+
+    async fn switch_rows<'a>(
+        &self,
+        slot: &'a mut Slot,
+        fresh: Option<Box<dyn Rows>>,
+    ) -> Result<&'a mut Box<dyn Rows>> {
         self.send_ready(slot).await?;
-        let schema = row.schema();
-        let other_schema = slot.rows.as_mut().is_some_and(|rows| {
-            !rows
-                .as_any()
-                .downcast_ref::<BatchRows>()
-                .is_some_and(|buffer| buffer.accepts(&schema))
-        });
-        if other_schema {
-            self.send_rows(slot, false).await?;
-            slot.rows = None;
+        if let Some(fresh) = fresh {
+            if slot.rows.is_some() {
+                self.send_rows(slot, false).await?;
+            }
+            slot.rows = Some(fresh);
         }
-        if slot.rows.is_none() {
-            slot.writer.check_shape(&schema)?;
-        }
-        slot.writer.check_nulls(&row)?;
-        let rows = slot
-            .rows
-            .get_or_insert_with(|| Box::new(BatchRows::new(schema)));
-        let Some(buffer) = rows.as_any().downcast_mut::<BatchRows>() else {
-            return Err(Error::new(
-                ErrorKind::Stream,
-                "record buffer of another type",
-            ));
-        };
-        buffer.append(row, size);
+        slot.rows.as_mut().ok_or_else(other_buffer)
+    }
+
+    async fn appended(&self, slot: &mut Slot, timestamp_ns: i64) -> Result<bool> {
         self.last_timestamp.store(timestamp_ns, Ordering::Relaxed);
-        match rows.ready(&slot.policy, slot.writer.target_bytes()) {
-            Ready::No => {}
-            Ready::Chunk => slot.ready = rows.take(false)?,
-            Ready::Policy => slot.ready = rows.take(true)?,
+        if let Some(rows) = slot.rows.as_mut() {
+            match rows.ready(&slot.policy, slot.writer.target_bytes()) {
+                Ready::No => {}
+                Ready::Chunk => slot.ready = rows.take(false)?,
+                Ready::Policy => slot.ready = rows.take(true)?,
+            }
         }
         self.send_ready(slot).await?;
         Ok(true)
@@ -694,6 +712,10 @@ impl TopicState {
 
     async fn close_slot(&self, slot: &mut Option<Slot>, close: Close<'_>) -> Result<()> {
         let Some(open) = slot.as_mut() else {
+            if let Close::Discard(reason) = close {
+                self.discard_closing(reason);
+                return Ok(());
+            }
             return self.closed().await;
         };
         let (sent, reason) = match close {
@@ -742,6 +764,10 @@ fn terminal(status: TopicWriterStatus) -> bool {
         status,
         TopicWriterStatus::Finalized | TopicWriterStatus::FinalizedWithError
     )
+}
+
+fn other_buffer() -> Error {
+    Error::new(ErrorKind::Stream, "record buffer of another type")
 }
 
 fn timestamp_range(batch: &RecordBatch) -> Result<Option<(i64, i64)>> {
@@ -808,7 +834,7 @@ mod tests {
             String::new(),
             schema,
             connection.scope().token(),
-            Interrupter::default(),
+            Interrupter::new(),
         );
         let topic = TopicState::new(
             "Empty".to_owned(),
@@ -969,6 +995,42 @@ mod tests {
                 format!("topic '/t' is finalized: {error}")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn discard_skips_pending_close() {
+        use futures::FutureExt;
+
+        let writer = offline_writer(TopicErrorPolicy::Raise);
+        assert!(writer.finalize(None).now_or_never().is_none());
+        let discarded = writer.topic.close(Close::Discard("deleted")).now_or_never();
+        assert!(matches!(discarded, Some(Ok(()))));
+        assert_eq!(writer.status(), TopicWriterStatus::FinalizedWithError);
+        assert_eq!(writer.last_error().as_deref(), Some("deleted"));
+        writer.finalize(None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_push_status() {
+        use futures::FutureExt;
+
+        let writer = offline_writer(TopicErrorPolicy::Ignore);
+        wait_for_the_upload_to_fail(&writer).await;
+        let row = batch(vec![Some(1)]);
+        assert!(writer.push_row(row.clone()).now_or_never().is_none());
+        let error = writer.push_row(row.clone()).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("the upload of topic '/t' failed: ")
+        );
+        assert_eq!(writer.status(), TopicWriterStatus::FinalizedWithError);
+        assert_eq!(writer.last_error(), Some(error.to_string()));
+        let pushed = writer.push_row(row).await.unwrap_err();
+        assert_eq!(
+            pushed.to_string(),
+            format!("topic '/t' is finalized: {error}")
+        );
     }
 
     #[tokio::test]
@@ -1136,7 +1198,7 @@ mod tests {
     }
 
     macro_rules! empty_record {
-        ($name:ident, $tag:literal, $format:expr) => {
+        ($name:ident, $tag:literal, $format:expr, $size:expr) => {
             struct $name;
 
             impl Ontology for $name {
@@ -1164,15 +1226,16 @@ mod tests {
                 }
 
                 fn size(&self) -> usize {
-                    8
+                    $size
                 }
             }
         };
     }
 
-    empty_record!(Empty, "Empty", Format::Default);
-    empty_record!(Other, "Other", Format::Default);
-    empty_record!(RaggedEmpty, "Empty", Format::Ragged);
+    empty_record!(Empty, "Empty", Format::Default, 8);
+    empty_record!(Other, "Other", Format::Default, 8);
+    empty_record!(HugeOther, "Other", Format::Default, 1 << 21);
+    empty_record!(RaggedEmpty, "Empty", Format::Ragged, 8);
 
     #[tokio::test]
     async fn push_checks_tag_and_format() {
@@ -1188,7 +1251,23 @@ mod tests {
             error.to_string(),
             "topic '/t' stores Empty (Default), not Empty (Ragged)"
         );
+        let error = writer.push(1, &HugeOther).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidArgument);
+        assert_eq!(writer.dropped_records(), 0);
         writer.push(1, &Empty).await.unwrap();
         writer.push(2, &Empty).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_row_checked_first() {
+        let writer = offline_writer(TopicErrorPolicy::Raise);
+        let timestamps: ArrayRef = Arc::new(Int64Array::from(vec![1]));
+        let payload: ArrayRef = Arc::new(arrow_array::BinaryArray::from(vec![
+            vec![0u8; 1 << 21].as_slice(),
+        ]));
+        let row =
+            RecordBatch::try_from_iter([(TIMESTAMP, timestamps), ("payload", payload)]).unwrap();
+        assert!(writer.push_row(row).await.is_err());
+        assert_eq!(writer.dropped_records(), 0);
     }
 }
