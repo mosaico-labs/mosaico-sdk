@@ -41,7 +41,7 @@ impl Client {
         };
         let mut options = ConnectOptions::new(host, port);
         options.connect_timeout = parse_seconds("timeout", timeout)?;
-        options.tls = tls || tls_cert.is_some();
+        options.tls = tls;
         options.tls_cert = tls_cert.map(<[u8]>::to_vec);
         options.api_key = api_key;
         options.compression = compression;

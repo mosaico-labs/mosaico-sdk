@@ -44,10 +44,6 @@ def _metadata(metadata: dict[str, Any] | None) -> bytes | None:
     return json.dumps(metadata).encode("utf-8")
 
 
-def _topic_key(name: str) -> str:
-    return "/" + "/".join(part for part in name.split("/") if part not in ("", "."))
-
-
 def _timestamps(value: Any) -> pa.Array:
     if isinstance(value, pa.Array):
         array = value
@@ -128,6 +124,14 @@ class _SessionWriter:
             if core.left_open:
                 _log.error("the write session '%s' was left open on the server%s", self._locator, self._cleanup())
 
+    def __del__(self) -> None:
+        if getattr(self, "_status", None) is SessionStatus.Pending:
+            _log.warning(
+                "the write session '%s' was never closed and stays open on the server%s",
+                self._locator,
+                self._cleanup(),
+            )
+
     def _abort(self, core: _core.SequenceWriter, exc: BaseException) -> None:
         self._status = SessionStatus.Error
         try:
@@ -170,22 +174,22 @@ class _SessionWriter:
         policy = TopicLevelErrorPolicy(on_error.value)
         tag = ontology.__ontology_tag__
         assert tag is not None
+        writer = core.topic_create(
+            topic_name,
+            tag,
+            ontology.__serialization_format__.value,
+            schema,
+            _metadata(metadata),
+            policy.value,
+        )
+        topic = TopicWriter(writer, ontology, schema)
         with self._lock:
-            writer = core.topic_create(
-                topic_name,
-                tag,
-                ontology.__serialization_format__.value,
-                schema,
-                _metadata(metadata),
-                policy.value,
-            )
-            topic = TopicWriter(writer, ontology, schema)
             self._topics[writer.name] = topic
         return topic
 
     def get_topic_writer(self, topic_name: str) -> TopicWriter:
         self._started()
-        key = _topic_key(topic_name)
+        key = _core.topic_name(topic_name)
         with self._lock:
             topic = self._topics.get(key)
         if topic is None:
@@ -195,7 +199,7 @@ class _SessionWriter:
     def topic_writer_exists(self, topic_name: str) -> bool:
         self._started()
         with self._lock:
-            return _topic_key(topic_name) in self._topics
+            return _core.topic_name(topic_name) in self._topics
 
     def list_topic_writers(self) -> list[str]:
         self._started()
@@ -362,9 +366,9 @@ class TopicWriter:
         if dropped:
             self._dropped_warned = True
             _log.warning(
-                "topic '%s': %d records dropped, each larger alone than the server's message size limit",
-                self.name,
+                "%d record(s) dropped for topic '%s': each is larger alone than the server's message size limit",
                 dropped,
+                self.name,
             )
 
     _finalize = finalize

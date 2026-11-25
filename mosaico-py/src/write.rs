@@ -56,7 +56,7 @@ impl SequenceWriter {
                 left_open(&result);
                 match result {
                     Ok(()) => Ok(Some(signal)),
-                    Err(error) => Err(interrupted(py, signal, sequence_error(error))),
+                    Err(error) => Err(interrupted(py, signal, error, sequence_error)),
                 }
             }
             Closing::Abandoned(signal) => {
@@ -71,8 +71,10 @@ fn ended() -> PyErr {
     StreamClosedError::new_err("the write session has already ended")
 }
 
-fn interrupted(py: Python<'_>, signal: PyErr, error: PyErr) -> PyErr {
-    if !error.is_instance_of::<StreamClosedError>(py) {
+fn interrupted(py: Python<'_>, signal: PyErr, error: Error, convert: fn(Error) -> PyErr) -> PyErr {
+    let left_open = error.left_open();
+    let error = convert(error);
+    if left_open || !error.is_instance_of::<StreamClosedError>(py) {
         signal.set_cause(py, Some(error));
     }
     signal
@@ -173,24 +175,10 @@ impl SequenceWriter {
         let writer = match created {
             Closing::Done(created) => created.ok_or_else(ended)?.map_err(sequence_error)?,
             Closing::Interrupted(Some(Err(error)), signal) => {
-                return Err(interrupted(py, signal, sequence_error(error)));
+                return Err(interrupted(py, signal, error, sequence_error));
             }
             Closing::Interrupted(_, signal) | Closing::Abandoned(signal) => return Err(signal),
         };
-        Ok(TopicWriter::new(writer, self.interrupter.clone()))
-    }
-
-    fn get_topic_writer(&self, py: Python<'_>, name: &str) -> PyResult<TopicWriter> {
-        let inner = self.inner.get()?;
-        let writer = wait(py, async {
-            inner
-                .lock()
-                .await
-                .as_ref()
-                .map(|writer| writer.get_topic_writer(name))
-        })?
-        .ok_or_else(ended)?
-        .map_err(to_py)?;
         Ok(TopicWriter::new(writer, self.interrupter.clone()))
     }
 
@@ -340,7 +328,7 @@ impl TopicWriter {
         let writer = self.0.get()?;
         match wait_closing(py, writer.handle_error(reason), &self.2)? {
             Closing::Done(result) => result.map_err(to_py),
-            Closing::Interrupted(Err(error), signal) => Err(interrupted(py, signal, to_py(error))),
+            Closing::Interrupted(Err(error), signal) => Err(interrupted(py, signal, error, to_py)),
             Closing::Interrupted(Ok(_), signal) | Closing::Abandoned(signal) => Err(signal),
         }
     }
@@ -350,7 +338,7 @@ impl TopicWriter {
         let writer = self.0.get()?;
         match wait_closing(py, writer.finalize(error), &self.2)? {
             Closing::Done(result) => result.map_err(to_py),
-            Closing::Interrupted(Err(error), signal) => Err(interrupted(py, signal, to_py(error))),
+            Closing::Interrupted(Err(error), signal) => Err(interrupted(py, signal, error, to_py)),
             Closing::Interrupted(Ok(()), signal) | Closing::Abandoned(signal) => Err(signal),
         }
     }
@@ -381,4 +369,9 @@ impl TopicWriter {
         let writer = self.0.get()?;
         run(py, writer.set_flush_policy(policy))
     }
+}
+
+#[pyfunction]
+pub(crate) fn topic_name(name: &str) -> String {
+    mosaico_core::topic_name(name)
 }
