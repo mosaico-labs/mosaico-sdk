@@ -86,7 +86,6 @@
         <path class="dep" d="M420 428 V519 H262"/>
         <path class="dep" d="M715 188 V248"/>
         <path class="dep" d="M890 188 V248"/>
-        <path class="dep" d="M760 308 V368"/>
         <path class="dep" d="M880 308 V368"/>
 
         <!-- uses the connection -->
@@ -97,6 +96,7 @@
         <path class="use" d="M570 188 V588"/>
         <path class="use" d="M650 308 V588"/>
         <path class="use" d="M810 428 V588"/>
+        <path class="use" d="M940 308 V588"/>
 
         <!-- boxes -->
         <g class="box" data-k="qresp" tabindex="0" role="button" aria-label="QueryResponse"><rect x="40" y="20" width="180" height="58" rx="8"/>
@@ -141,12 +141,12 @@
         <text class="dl" x="340" y="512" text-anchor="middle">×K topics · ×N ranges</text>
         <text class="dl" x="723" y="222">owns</text>
         <text class="dl" x="882" y="222" text-anchor="end">topic_create()</text>
-        <text class="dl" x="752" y="342" text-anchor="end">create_topic()</text>
-        <text class="dl" x="888" y="342">push_batch</text>
+        <text class="dl" x="888" y="342">batches</text>
         <text class="ul" transform="translate(24 330) rotate(-90)" text-anchor="middle">do_action</text>
         <text class="ul" x="66" y="578">get_flight_info</text>
         <text class="ul" x="178" y="578">do_get</text>
         <text class="ul" x="562" y="578" text-anchor="end">get_flight_info</text>
         <text class="ul" x="658" y="578">do_action</text>
         <text class="ul" x="818" y="578">do_put</text>
+        <text class="ul" x="934" y="578" text-anchor="end">do_action</text>
       </svg>
