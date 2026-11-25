@@ -20,7 +20,7 @@ pub(super) const TIMESTAMP: &str = "timestamp_ns";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum TopicErrorPolicy {
+pub enum TopicLevelErrorPolicy {
     Raise,
     Finalize,
     Ignore,
@@ -76,7 +76,7 @@ impl TopicWriter {
         &self.topic.reporter.name
     }
 
-    pub fn dropped_records(&self) -> u64 {
+    pub fn dropped_record_count(&self) -> u64 {
         self.topic.reporter.status.dropped()
     }
 
@@ -124,21 +124,21 @@ impl TopicWriter {
         let mut guard = self.topic.slot.lock().await;
         if guard.is_none() {
             let _ = self.topic.closed().await;
-            return Ok(self.topic.on_error == TopicErrorPolicy::Ignore);
+            return Ok(self.topic.on_error == TopicLevelErrorPolicy::Ignore);
         }
         match self.topic.on_error {
-            TopicErrorPolicy::Raise => {
+            TopicLevelErrorPolicy::Raise => {
                 self.topic
                     .set_state(TopicWriterStatus::Raised, Some(reason.to_owned()));
                 Ok(false)
             }
-            TopicErrorPolicy::Ignore => {
+            TopicLevelErrorPolicy::Ignore => {
                 self.topic.reporter.report(reason).await;
                 self.topic
                     .set_state(TopicWriterStatus::IgnoredLastError, Some(reason.to_owned()));
                 Ok(true)
             }
-            TopicErrorPolicy::Finalize => self
+            TopicLevelErrorPolicy::Finalize => self
                 .topic
                 .close_slot(&mut guard, Close::Report(reason))
                 .await
@@ -267,7 +267,7 @@ impl Reporter {
 pub(super) struct TopicState {
     ontology_tag: String,
     format: Format,
-    on_error: TopicErrorPolicy,
+    on_error: TopicLevelErrorPolicy,
     reporter: Arc<Reporter>,
     slot: Mutex<Option<Slot>>,
     last_timestamp: AtomicI64,
@@ -352,7 +352,7 @@ impl TopicState {
     pub(super) fn new(
         ontology_tag: String,
         format: Format,
-        on_error: TopicErrorPolicy,
+        on_error: TopicLevelErrorPolicy,
         reporter: Arc<Reporter>,
         writer: BatchWriter,
     ) -> Self {
@@ -409,7 +409,7 @@ impl TopicState {
             .unwrap_or_else(PoisonError::into_inner) = Some((error.duplicate(), end_sent));
         (
             error,
-            (self.on_error != TopicErrorPolicy::Raise).then_some(reason),
+            (self.on_error != TopicLevelErrorPolicy::Raise).then_some(reason),
         )
     }
 
@@ -816,7 +816,7 @@ mod tests {
     use crate::ontology::{Ontology, RecordBuilder};
     use crate::write::session::Interrupter;
 
-    fn offline_writer(on_error: TopicErrorPolicy) -> TopicWriter {
+    fn offline_writer(on_error: TopicLevelErrorPolicy) -> TopicWriter {
         let connection = Connection::offline(1 << 20);
         let schema = Arc::new(Schema::new(vec![Field::new(
             TIMESTAMP,
@@ -849,14 +849,14 @@ mod tests {
     #[tokio::test]
     async fn error_after_finalize() {
         for policy in [
-            TopicErrorPolicy::Raise,
-            TopicErrorPolicy::Ignore,
-            TopicErrorPolicy::Finalize,
+            TopicLevelErrorPolicy::Raise,
+            TopicLevelErrorPolicy::Ignore,
+            TopicLevelErrorPolicy::Finalize,
         ] {
             let writer = offline_writer(policy);
             writer.topic.close(Close::Discard("closed")).await.unwrap();
             let suppressed = writer.handle_error("late push").await.unwrap();
-            assert_eq!(suppressed, policy == TopicErrorPolicy::Ignore);
+            assert_eq!(suppressed, policy == TopicLevelErrorPolicy::Ignore);
             assert_eq!(writer.status(), TopicWriterStatus::FinalizedWithError);
             assert_eq!(writer.last_error().as_deref(), Some("closed"));
         }
@@ -864,7 +864,7 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_policy_failed_close() {
-        let writer = offline_writer(TopicErrorPolicy::Finalize);
+        let writer = offline_writer(TopicLevelErrorPolicy::Finalize);
         let error = writer.handle_error("sensor lost").await.unwrap_err();
         assert_eq!(writer.status(), TopicWriterStatus::FinalizedWithError);
         assert_eq!(writer.last_error(), Some(error.to_string()));
@@ -874,7 +874,7 @@ mod tests {
     #[tokio::test]
     async fn finalize_once() {
         for reason in [None, Some("camera unplugged")] {
-            let writer = offline_writer(TopicErrorPolicy::Raise);
+            let writer = offline_writer(TopicLevelErrorPolicy::Raise);
             let error = writer.finalize(reason).await.unwrap_err();
             assert_eq!(writer.status(), TopicWriterStatus::FinalizedWithError);
             assert_eq!(writer.last_error(), Some(error.to_string()));
@@ -888,7 +888,7 @@ mod tests {
 
     #[tokio::test]
     async fn stream_read_error_sets_raised() {
-        let writer = offline_writer(TopicErrorPolicy::Raise);
+        let writer = offline_writer(TopicLevelErrorPolicy::Raise);
         let failing = futures::stream::iter([Err::<RecordBatch, _>(std::io::Error::other(
             "camera unplugged",
         ))]);
@@ -916,9 +916,9 @@ mod tests {
     #[tokio::test]
     async fn dead_upload_finalizes_topic() {
         for policy in [
-            TopicErrorPolicy::Raise,
-            TopicErrorPolicy::Ignore,
-            TopicErrorPolicy::Finalize,
+            TopicLevelErrorPolicy::Raise,
+            TopicLevelErrorPolicy::Ignore,
+            TopicLevelErrorPolicy::Finalize,
         ] {
             let writer = offline_writer(policy);
             wait_for_the_upload_to_fail(&writer).await;
@@ -943,7 +943,7 @@ mod tests {
             );
             assert_eq!(
                 writer.handle_error(&again.to_string()).await.unwrap(),
-                policy == TopicErrorPolicy::Ignore
+                policy == TopicLevelErrorPolicy::Ignore
             );
             assert_eq!(writer.status(), TopicWriterStatus::FinalizedWithError);
             assert_eq!(writer.last_error(), Some(error.to_string()));
@@ -954,7 +954,7 @@ mod tests {
 
     #[tokio::test]
     async fn upload_failure_at_close() {
-        let writer = offline_writer(TopicErrorPolicy::Raise);
+        let writer = offline_writer(TopicLevelErrorPolicy::Raise);
         wait_for_the_upload_to_fail(&writer).await;
         let error = writer.finalize(None).await.unwrap_err();
         assert!(
@@ -973,9 +973,9 @@ mod tests {
     async fn cancelled_close_status() {
         use futures::FutureExt;
 
-        let cancelled = offline_writer(TopicErrorPolicy::Raise);
+        let cancelled = offline_writer(TopicLevelErrorPolicy::Raise);
         assert!(cancelled.finalize(None).now_or_never().is_none());
-        let failed = offline_writer(TopicErrorPolicy::Ignore);
+        let failed = offline_writer(TopicLevelErrorPolicy::Ignore);
         wait_for_the_upload_to_fail(&failed).await;
         let row = batch(vec![Some(1)]);
         assert!(failed.push_row(row.clone()).now_or_never().is_none());
@@ -1001,7 +1001,7 @@ mod tests {
     async fn discard_skips_pending_close() {
         use futures::FutureExt;
 
-        let writer = offline_writer(TopicErrorPolicy::Raise);
+        let writer = offline_writer(TopicLevelErrorPolicy::Raise);
         assert!(writer.finalize(None).now_or_never().is_none());
         let discarded = writer.topic.close(Close::Discard("deleted")).now_or_never();
         assert!(matches!(discarded, Some(Ok(()))));
@@ -1014,7 +1014,7 @@ mod tests {
     async fn cancelled_push_status() {
         use futures::FutureExt;
 
-        let writer = offline_writer(TopicErrorPolicy::Ignore);
+        let writer = offline_writer(TopicLevelErrorPolicy::Ignore);
         wait_for_the_upload_to_fail(&writer).await;
         let row = batch(vec![Some(1)]);
         assert!(writer.push_row(row.clone()).now_or_never().is_none());
@@ -1035,7 +1035,7 @@ mod tests {
 
     #[tokio::test]
     async fn interrupted_upload_not_failed() {
-        let writer = offline_writer(TopicErrorPolicy::Raise);
+        let writer = offline_writer(TopicLevelErrorPolicy::Raise);
         let (closed, report) = writer.topic.upload_error(interrupted_error(), false);
         assert_eq!(closed.kind(), ErrorKind::Closed);
         assert!(report.is_none());
@@ -1239,7 +1239,7 @@ mod tests {
 
     #[tokio::test]
     async fn push_checks_tag_and_format() {
-        let writer = offline_writer(TopicErrorPolicy::Raise);
+        let writer = offline_writer(TopicLevelErrorPolicy::Raise);
         let error = writer.push(1, &Other).await.unwrap_err();
         assert_eq!(error.kind(), ErrorKind::InvalidArgument);
         assert_eq!(
@@ -1253,14 +1253,14 @@ mod tests {
         );
         let error = writer.push(1, &HugeOther).await.unwrap_err();
         assert_eq!(error.kind(), ErrorKind::InvalidArgument);
-        assert_eq!(writer.dropped_records(), 0);
+        assert_eq!(writer.dropped_record_count(), 0);
         writer.push(1, &Empty).await.unwrap();
         writer.push(2, &Empty).await.unwrap();
     }
 
     #[tokio::test]
     async fn oversized_row_checked_first() {
-        let writer = offline_writer(TopicErrorPolicy::Raise);
+        let writer = offline_writer(TopicLevelErrorPolicy::Raise);
         let timestamps: ArrayRef = Arc::new(Int64Array::from(vec![1]));
         let payload: ArrayRef = Arc::new(arrow_array::BinaryArray::from(vec![
             vec![0u8; 1 << 21].as_slice(),
@@ -1268,6 +1268,6 @@ mod tests {
         let row =
             RecordBatch::try_from_iter([(TIMESTAMP, timestamps), ("payload", payload)]).unwrap();
         assert!(writer.push_row(row).await.is_err());
-        assert_eq!(writer.dropped_records(), 0);
+        assert_eq!(writer.dropped_record_count(), 0);
     }
 }

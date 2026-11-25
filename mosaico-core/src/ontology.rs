@@ -52,11 +52,11 @@ pub trait RecordBuilder<T>: Default + Send + 'static {
 #[non_exhaustive]
 pub struct Message<'a, T: Ontology + 'a> {
     pub timestamp_ns: i64,
-    pub view: T::View<'a>,
+    pub data: T::View<'a>,
 }
 
 impl<'a, T: Ontology + 'a> Message<'a, T> {
     pub fn to_model(&self) -> Result<T> {
-        T::from_view(&self.view)
+        T::from_view(&self.data)
     }
 }

@@ -11,8 +11,8 @@ use crate::error::{Error, ErrorKind, Result};
 use crate::locator::{sequence_name, topic_name};
 use crate::ontology::Ontology;
 use crate::read::batch_reader::BatchReader;
-use crate::read::data_streamer::DataStreamer;
-use crate::read::streamer::BatchStreamer;
+use crate::read::data_streamer::TopicDataStreamer;
+use crate::read::streamer::TopicBatchStreamer;
 use crate::scope::{Scope, Token};
 
 #[derive(Clone)]
@@ -89,7 +89,7 @@ impl TopicHandler {
         Self::from_endpoint(connection, scope, sequence, &endpoint)
     }
 
-    pub fn sequence(&self) -> &str {
+    pub fn sequence_name(&self) -> &str {
         &self.sequence
     }
 
@@ -111,44 +111,52 @@ impl TopicHandler {
 
     pub async fn get_batch_streamer(
         &self,
-        start_ns: Option<i64>,
-        end_ns: Option<i64>,
-    ) -> Result<BatchStreamer> {
+        start_timestamp_ns: Option<i64>,
+        end_timestamp_ns: Option<i64>,
+    ) -> Result<TopicBatchStreamer> {
         self.connection.ensure_open()?;
         let token = self.scope.token();
         token
-            .run_until_closed(self.open_batches(start_ns, end_ns, token.clone()))
+            .run_until_closed(self.open_batches(
+                start_timestamp_ns,
+                end_timestamp_ns,
+                token.clone(),
+            ))
             .await
             .unwrap_or_else(|| Err(Error::new(ErrorKind::Closed, "stream closed")))
     }
 
     async fn open_batches(
         &self,
-        start_ns: Option<i64>,
-        end_ns: Option<i64>,
+        start_timestamp_ns: Option<i64>,
+        end_timestamp_ns: Option<i64>,
         token: Arc<Token>,
-    ) -> Result<BatchStreamer> {
+    ) -> Result<TopicBatchStreamer> {
         let locator = self.locator();
-        let range = (start_ns.is_some() || end_ns.is_some())
-            .then_some(proto::time::TimestampRange { start_ns, end_ns });
+        let range = (start_timestamp_ns.is_some() || end_timestamp_ns.is_some()).then_some(
+            proto::time::TimestampRange {
+                start_ns: start_timestamp_ns,
+                end_ns: end_timestamp_ns,
+            },
+        );
         let ticket = match (&self.ticket, range) {
             (Some(ticket), None) => Some(ticket.clone()),
             (_, range) => self.refetch(range).await?.ticket,
         };
         let Some(ticket) = ticket else {
-            return Ok(BatchStreamer::empty(token));
+            return Ok(TopicBatchStreamer::empty(token));
         };
         let reader = BatchReader::open(&self.connection, ticket, token.clone())
             .await
             .map_err(|e| e.or_not_found(|| format!("topic '{locator}' not found")))?;
-        Ok(BatchStreamer::single(reader, token))
+        Ok(TopicBatchStreamer::single(reader, token))
     }
 
     pub async fn get_data_streamer<T: Ontology>(
         &self,
-        start_ns: Option<i64>,
-        end_ns: Option<i64>,
-    ) -> Result<DataStreamer<T>> {
+        start_timestamp_ns: Option<i64>,
+        end_timestamp_ns: Option<i64>,
+    ) -> Result<TopicDataStreamer<T>> {
         self.connection.ensure_open()?;
         if self.ontology_tag != T::TAG {
             return Err(Error::new(
@@ -161,16 +169,20 @@ impl TopicHandler {
                 ),
             ));
         }
-        let batches = self.get_batch_streamer(start_ns, end_ns).await?;
-        DataStreamer::new(batches)
+        let batches = self
+            .get_batch_streamer(start_timestamp_ns, end_timestamp_ns)
+            .await?;
+        TopicDataStreamer::new(batches)
     }
 
     pub async fn to_arrow(
         &self,
-        start_ns: Option<i64>,
-        end_ns: Option<i64>,
+        start_timestamp_ns: Option<i64>,
+        end_timestamp_ns: Option<i64>,
     ) -> Result<(SchemaRef, Vec<RecordBatch>)> {
-        let mut streamer = self.get_batch_streamer(start_ns, end_ns).await?;
+        let mut streamer = self
+            .get_batch_streamer(start_timestamp_ns, end_timestamp_ns)
+            .await?;
         let schema = streamer.schema().clone();
         let mut batches = Vec::new();
         while let Some(batch) = streamer.next_batch().await? {

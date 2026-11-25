@@ -4,7 +4,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use arrow_array::{ArrayRef, BinaryArray, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use mosaico_core::{
-    ConnectOptions, Format, MosaicoClient, SessionErrorPolicy, TopicErrorPolicy, TopicWriterStatus,
+    ConnectOptions, Format, MosaicoClient, SessionLevelErrorPolicy, TopicLevelErrorPolicy,
+    TopicWriterStatus,
 };
 
 const ROW_BYTES: usize = 4 << 20;
@@ -54,7 +55,7 @@ async fn cancelled_close_finishes_upload() {
     };
     let sequence = unique("rust_e2e_cancelled_close");
     let mut writer = client
-        .sequence_create(&sequence, None, SessionErrorPolicy::Report)
+        .sequence_create(&sequence, None, SessionLevelErrorPolicy::Report)
         .await
         .unwrap();
     let topic = writer
@@ -64,7 +65,7 @@ async fn cancelled_close_finishes_upload() {
             Format::Default,
             schema(),
             None,
-            TopicErrorPolicy::Raise,
+            TopicLevelErrorPolicy::Raise,
         )
         .await
         .unwrap();

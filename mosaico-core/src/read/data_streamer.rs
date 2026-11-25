@@ -4,7 +4,7 @@ use arrow_array::{Array, Int64Array, RecordBatch};
 
 use crate::error::{Error, Result};
 use crate::ontology::{Message, Ontology};
-use crate::read::streamer::BatchStreamer;
+use crate::read::streamer::TopicBatchStreamer;
 
 pub(crate) const TIMESTAMP_COLUMN: &str = "timestamp_ns";
 
@@ -14,13 +14,13 @@ struct Current<T: Ontology> {
     row: usize,
 }
 
-pub struct DataStreamer<T: Ontology> {
-    batches: BatchStreamer,
+pub struct TopicDataStreamer<T: Ontology> {
+    batches: TopicBatchStreamer,
     current: Option<Current<T>>,
 }
 
-impl<T: Ontology> DataStreamer<T> {
-    pub(crate) fn new(batches: BatchStreamer) -> Result<Self> {
+impl<T: Ontology> TopicDataStreamer<T> {
+    pub(crate) fn new(batches: TopicBatchStreamer) -> Result<Self> {
         if !batches.is_finished() {
             read_batch::<T>(&RecordBatch::new_empty(batches.schema().clone()))?;
         }
@@ -59,7 +59,7 @@ impl<T: Ontology> DataStreamer<T> {
         current.row += 1;
         Ok(Some(Message {
             timestamp_ns: current.timestamps.value(row),
-            view: T::view(&current.columns, row),
+            data: T::view(&current.columns, row),
         }))
     }
 
@@ -140,10 +140,10 @@ mod tests {
             batch(&schema, vec![Some(3)]),
         ];
         let source = streamer(schema, batches, Tail::End).await;
-        let mut stream = DataStreamer::<Value>::new(source).unwrap();
+        let mut stream = TopicDataStreamer::<Value>::new(source).unwrap();
         let mut rows = Vec::new();
         while let Some(msg) = stream.next().await.unwrap() {
-            rows.push((msg.timestamp_ns, msg.view));
+            rows.push((msg.timestamp_ns, msg.data));
         }
         assert_eq!(rows, vec![(1, 10), (2, 20), (3, 30)]);
         assert!(stream.next().await.unwrap().is_none());
@@ -157,7 +157,7 @@ mod tests {
             false,
         )]));
         let source = streamer(schema, Vec::new(), Tail::Hang).await;
-        let error = DataStreamer::<Value>::new(source).err().unwrap();
+        let error = TopicDataStreamer::<Value>::new(source).err().unwrap();
         assert_eq!(error.kind(), ErrorKind::Schema);
     }
 
@@ -166,7 +166,7 @@ mod tests {
         let schema = schema(true);
         let batches = vec![batch(&schema, vec![Some(1)]), batch(&schema, vec![None])];
         let source = streamer(schema, batches, Tail::End).await;
-        let mut stream = DataStreamer::<Value>::new(source).unwrap();
+        let mut stream = TopicDataStreamer::<Value>::new(source).unwrap();
         assert_eq!(stream.next().await.unwrap().unwrap().timestamp_ns, 1);
         let failed = stream.next().await.err().unwrap();
         assert_eq!(failed.kind(), ErrorKind::Schema);

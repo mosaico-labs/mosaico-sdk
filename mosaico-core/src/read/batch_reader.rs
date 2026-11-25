@@ -132,7 +132,7 @@ pub(crate) mod testing {
     use futures::stream::{self, BoxStream, StreamExt};
 
     use super::BatchReader;
-    use crate::read::streamer::BatchStreamer;
+    use crate::read::streamer::TopicBatchStreamer;
     use crate::scope::Scope;
 
     pub(crate) enum Tail {
@@ -145,7 +145,7 @@ pub(crate) mod testing {
         schema: SchemaRef,
         batches: Vec<RecordBatch>,
         tail: Tail,
-    ) -> BatchStreamer {
+    ) -> TopicBatchStreamer {
         let encoded = FlightDataEncoderBuilder::new()
             .with_schema(schema)
             .build(stream::iter(batches.into_iter().map(Ok)));
@@ -159,6 +159,6 @@ pub(crate) mod testing {
         let token = Scope::root().token();
         let decoder = FlightDataDecoder::new(encoded.chain(tail));
         let reader = BatchReader::start(decoder, token.clone()).await.unwrap();
-        BatchStreamer::single(reader, token)
+        TopicBatchStreamer::single(reader, token)
     }
 }

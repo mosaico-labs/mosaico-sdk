@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as SchemaLock, PoisonError};
 
 use mosaico_core::{
-    Encode, Error, FlushPolicy, Format, Interrupter, TopicErrorPolicy, TopicWriterStatus,
+    Encode, Error, FlushPolicy, Format, Interrupter, TopicLevelErrorPolicy, TopicWriterStatus,
 };
 use pyo3::exceptions::PyBaseException;
 use pyo3::prelude::*;
@@ -147,9 +147,9 @@ impl SequenceWriter {
             other => return Err(invalid(format!("unknown serialization format '{other}'"))),
         };
         let on_error = match on_error {
-            "raise" => TopicErrorPolicy::Raise,
-            "finalize" => TopicErrorPolicy::Finalize,
-            "ignore" => TopicErrorPolicy::Ignore,
+            "raise" => TopicLevelErrorPolicy::Raise,
+            "finalize" => TopicLevelErrorPolicy::Finalize,
+            "ignore" => TopicLevelErrorPolicy::Ignore,
             other => {
                 return Err(invalid(format!(
                     "topic error policy must be 'raise', 'finalize' or 'ignore', not '{other}'"
@@ -280,8 +280,8 @@ impl TopicWriter {
     }
 
     #[getter]
-    fn dropped_records(&self) -> PyResult<u64> {
-        Ok(self.0.get()?.dropped_records())
+    fn dropped_record_count(&self) -> PyResult<u64> {
+        Ok(self.0.get()?.dropped_record_count())
     }
 
     fn push_batch(&self, py: Python<'_>, batch: &Bound<'_, PyAny>) -> PyResult<()> {

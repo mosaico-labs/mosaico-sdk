@@ -30,7 +30,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let mut kept = Vec::new();
     let mut streamer = imu.get_data_streamer::<Imu>(Some(t0), Some(t1)).await?;
     while let Some(msg) = streamer.next().await? {
-        if msg.view.acceleration()?.z()? > 15.0 {
+        if msg.data.acceleration()?.z()? > 15.0 {
             kept.push(msg.to_model()?);
         }
     }

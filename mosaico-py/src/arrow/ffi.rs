@@ -329,11 +329,11 @@ pub(crate) fn arrow_error(error: ArrowError) -> PyErr {
 
 pub(crate) struct BlockingReader {
     schema: SchemaRef,
-    streamer: ProcessBound<mosaico_core::BatchStreamer>,
+    streamer: ProcessBound<mosaico_core::TopicBatchStreamer>,
 }
 
 impl BlockingReader {
-    pub(crate) fn new(schema: SchemaRef, streamer: mosaico_core::BatchStreamer) -> Self {
+    pub(crate) fn new(schema: SchemaRef, streamer: mosaico_core::TopicBatchStreamer) -> Self {
         Self {
             schema,
             streamer: ProcessBound::new(streamer),
@@ -361,7 +361,7 @@ impl RecordBatchReader for BlockingReader {
 }
 
 fn next_blocking(
-    streamer: &mut mosaico_core::BatchStreamer,
+    streamer: &mut mosaico_core::TopicBatchStreamer,
 ) -> Option<Result<RecordBatch, ArrowError>> {
     let runtime = match runtime() {
         Ok(runtime) => runtime,

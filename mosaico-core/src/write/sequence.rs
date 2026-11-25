@@ -4,13 +4,13 @@ use arrow_schema::SchemaRef;
 
 use crate::comm::connection::Connection;
 use crate::error::{Error, ErrorKind, Result};
-use crate::locator::{new_topic_name, topic_name};
+use crate::locator::{self, new_topic_name};
 use crate::ontology::{Encode, Format};
 use crate::write::batch_writer::BatchWriter;
 use crate::write::rows::record_schema;
 use crate::write::schema_rules::check_schema;
-use crate::write::session::{Interrupter, Session, SessionErrorPolicy, interrupted_error};
-use crate::write::topic::{Close, Reporter, TopicErrorPolicy, TopicState, TopicWriter};
+use crate::write::session::{Interrupter, Session, SessionLevelErrorPolicy, interrupted_error};
+use crate::write::topic::{Close, Reporter, TopicLevelErrorPolicy, TopicState, TopicWriter};
 
 const INTERRUPTED: &str = "interrupted";
 
@@ -24,7 +24,7 @@ impl SequenceWriter {
         connection: &Connection,
         name: &str,
         metadata: Option<Vec<u8>>,
-        on_error: SessionErrorPolicy,
+        on_error: SessionLevelErrorPolicy,
     ) -> Result<Self> {
         let session = Session::create(connection, name, metadata, on_error).await?;
         Ok(Self {
@@ -36,7 +36,7 @@ impl SequenceWriter {
     pub(crate) async fn update(
         connection: &Connection,
         name: &str,
-        on_error: SessionErrorPolicy,
+        on_error: SessionLevelErrorPolicy,
     ) -> Result<Self> {
         let session = Session::update(connection, name, on_error).await?;
         Ok(Self {
@@ -59,14 +59,14 @@ impl SequenceWriter {
 
     pub async fn topic_create(
         &mut self,
-        name: &str,
+        topic_name: &str,
         ontology_tag: &str,
         format: Format,
         schema: SchemaRef,
         metadata: Option<Vec<u8>>,
-        on_error: TopicErrorPolicy,
+        on_error: TopicLevelErrorPolicy,
     ) -> Result<TopicWriter> {
-        let name = new_topic_name(name)?;
+        let name = new_topic_name(topic_name)?;
         if self.topics.iter().any(|topic| topic.name() == name) {
             return Err(Error::new(
                 ErrorKind::AlreadyExists,
@@ -101,17 +101,17 @@ impl SequenceWriter {
 
     pub async fn topic_create_for<T: Encode>(
         &mut self,
-        name: &str,
+        topic_name: &str,
         metadata: Option<Vec<u8>>,
-        on_error: TopicErrorPolicy,
+        on_error: TopicLevelErrorPolicy,
     ) -> Result<TopicWriter> {
         let schema = record_schema::<T>();
-        self.topic_create(name, T::TAG, T::FORMAT, schema, metadata, on_error)
+        self.topic_create(topic_name, T::TAG, T::FORMAT, schema, metadata, on_error)
             .await
     }
 
-    pub fn get_topic_writer(&self, name: &str) -> Result<TopicWriter> {
-        let name = topic_name(name);
+    pub fn topic_writer(&self, topic_name: &str) -> Result<TopicWriter> {
+        let name = locator::topic_name(topic_name);
         self.topics
             .iter()
             .find(|topic| topic.name() == name)
@@ -185,7 +185,7 @@ impl SequenceWriter {
 mod tests {
     use super::*;
 
-    fn offline(policy: SessionErrorPolicy) -> SequenceWriter {
+    fn offline(policy: SessionLevelErrorPolicy) -> SequenceWriter {
         SequenceWriter {
             session: Session::offline(policy),
             topics: Vec::new(),
@@ -194,7 +194,10 @@ mod tests {
 
     #[tokio::test]
     async fn complete_err_returns_error() {
-        for policy in [SessionErrorPolicy::Report, SessionErrorPolicy::Delete] {
+        for policy in [
+            SessionLevelErrorPolicy::Report,
+            SessionLevelErrorPolicy::Delete,
+        ] {
             let failed: Result<()> = Err(Error::invalid_argument("camera unplugged"));
             let error = offline(policy).complete(failed).await.unwrap_err();
             assert_eq!(error.kind(), ErrorKind::InvalidArgument);
@@ -209,7 +212,10 @@ mod tests {
 
     #[tokio::test]
     async fn interrupted_finish() {
-        for policy in [SessionErrorPolicy::Report, SessionErrorPolicy::Delete] {
+        for policy in [
+            SessionLevelErrorPolicy::Report,
+            SessionLevelErrorPolicy::Delete,
+        ] {
             let writer = offline(policy);
             writer.session.interrupter().interrupt();
             let error = writer.finish().await.unwrap_err();
@@ -224,7 +230,7 @@ mod tests {
 
     #[tokio::test]
     async fn complete_ok_finishes() {
-        let error = offline(SessionErrorPolicy::Report)
+        let error = offline(SessionLevelErrorPolicy::Report)
             .complete(Ok(7))
             .await
             .unwrap_err();

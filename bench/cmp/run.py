@@ -172,7 +172,7 @@ def verify(client: m.MosaicoClient, kind: str, sequence: str, rows: int, png: bo
     import mosaicolabs
 
     if png:
-        handler = client.topic_handler(sequence, TOPICS[kind], ontology=mosaicolabs.Image)
+        handler = client.topic_handler(sequence, TOPICS[kind], ontology_type=mosaicolabs.Image)
         written = handler.to_arrow()
         return set(written.column("format").to_pylist()) == {"png"} and image_fingerprint(
             written, png_pixels
@@ -180,11 +180,11 @@ def verify(client: m.MosaicoClient, kind: str, sequence: str, rows: int, png: bo
 
     if kind == "multi":
         return all(
-            fingerprint(client.topic_handler(sequence, f"/{k}", ontology=getattr(mosaicolabs, CLASSES[k])).to_arrow(), k)
+            fingerprint(client.topic_handler(sequence, f"/{k}", ontology_type=getattr(mosaicolabs, CLASSES[k])).to_arrow(), k)
             == fingerprint(source(k, n), k)
             for k, n in MULTI
         )
-    handler = client.topic_handler(sequence, TOPICS[kind], ontology=getattr(mosaicolabs, CLASSES[kind]))
+    handler = client.topic_handler(sequence, TOPICS[kind], ontology_type=getattr(mosaicolabs, CLASSES[kind]))
     return fingerprint(handler.to_arrow(), kind) == fingerprint(source(kind, rows), kind)
 
 

@@ -10,7 +10,8 @@ use arrow_array::{
 use arrow_buffer::OffsetBuffer;
 use arrow_schema::{ArrowError, DataType, Field, Fields, Schema, SchemaRef};
 use mosaico_core::{
-    Compression, ConnectOptions, Format, MosaicoClient, SessionErrorPolicy, TopicErrorPolicy,
+    Compression, ConnectOptions, Format, MosaicoClient, SessionLevelErrorPolicy,
+    TopicLevelErrorPolicy,
 };
 
 const T0: i64 = 1_700_000_000_000_000_000;
@@ -368,7 +369,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
 
     let mut pushing = Duration::ZERO;
     let mut writer = client
-        .sequence_create(sequence, None, SessionErrorPolicy::Delete)
+        .sequence_create(sequence, None, SessionLevelErrorPolicy::Delete)
         .await?;
     let result = async {
         let topic = writer
@@ -378,7 +379,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 kind.format(),
                 kind.schema(),
                 None,
-                TopicErrorPolicy::Raise,
+                TopicLevelErrorPolicy::Raise,
             )
             .await?;
         let mut start = 0;
@@ -393,7 +394,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             start += n;
             eprint!("\r{start}/{rows}");
         }
-        Ok(topic.dropped_records())
+        Ok(topic.dropped_record_count())
     }
     .await;
     let finishing = Instant::now();
@@ -442,7 +443,7 @@ async fn run_multi(
     plan.push((Kind::Imu, "/imu".to_owned(), imu_rows, imu_batch));
 
     let mut writer = client
-        .sequence_create(sequence, None, SessionErrorPolicy::Delete)
+        .sequence_create(sequence, None, SessionLevelErrorPolicy::Delete)
         .await?;
     let result = async {
         let mut tasks = Vec::new();
@@ -454,7 +455,7 @@ async fn run_multi(
                     kind.format(),
                     kind.schema(),
                     None,
-                    TopicErrorPolicy::Raise,
+                    TopicLevelErrorPolicy::Raise,
                 )
                 .await?;
             tasks.push(tokio::spawn(async move {

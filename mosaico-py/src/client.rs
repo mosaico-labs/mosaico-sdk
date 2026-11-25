@@ -1,4 +1,4 @@
-use mosaico_core::{Compression, ConnectOptions, Notification, SessionErrorPolicy};
+use mosaico_core::{Compression, ConnectOptions, Notification, SessionLevelErrorPolicy};
 use pyo3::prelude::*;
 
 use crate::errors::{invalid, parse_seconds, sequence_error};
@@ -173,18 +173,18 @@ type NotificationTuple = (String, Option<String>, String, String, String);
 
 fn tuple(notification: Notification) -> NotificationTuple {
     (
-        notification.sequence,
-        notification.topic,
+        notification.sequence_name,
+        notification.topic_name,
         notification.kind,
         notification.message,
         notification.created_at,
     )
 }
 
-fn session_policy(value: &str) -> PyResult<SessionErrorPolicy> {
+fn session_policy(value: &str) -> PyResult<SessionLevelErrorPolicy> {
     match value {
-        "report" => Ok(SessionErrorPolicy::Report),
-        "delete" => Ok(SessionErrorPolicy::Delete),
+        "report" => Ok(SessionLevelErrorPolicy::Report),
+        "delete" => Ok(SessionLevelErrorPolicy::Delete),
         other => Err(invalid(format!(
             "session error policy must be 'report' or 'delete', not '{other}'"
         ))),

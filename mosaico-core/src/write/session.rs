@@ -42,7 +42,7 @@ pub(crate) struct CreatedTopic {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum SessionErrorPolicy {
+pub enum SessionLevelErrorPolicy {
     Report,
     Delete,
 }
@@ -53,7 +53,7 @@ pub(crate) struct Session {
     sequence: String,
     locator: String,
     uuid: String,
-    policy: SessionErrorPolicy,
+    policy: SessionLevelErrorPolicy,
     owns_sequence: bool,
     has_topics: AtomicBool,
     interrupter: Interrupter,
@@ -64,7 +64,7 @@ impl Session {
         connection: &Connection,
         sequence: &str,
         metadata: Option<Vec<u8>>,
-        policy: SessionErrorPolicy,
+        policy: SessionLevelErrorPolicy,
     ) -> Result<Self> {
         let sequence = new_sequence_name(sequence)?.to_owned();
         let request = proto::requests::SequenceCreate {
@@ -89,7 +89,7 @@ impl Session {
     pub(crate) async fn update(
         connection: &Connection,
         sequence: &str,
-        policy: SessionErrorPolicy,
+        policy: SessionLevelErrorPolicy,
     ) -> Result<Self> {
         let sequence = sequence_name(sequence)?.to_owned();
         Self::open(connection, sequence, policy, false).await
@@ -98,7 +98,7 @@ impl Session {
     async fn open(
         connection: &Connection,
         sequence: String,
-        policy: SessionErrorPolicy,
+        policy: SessionLevelErrorPolicy,
         owns_sequence: bool,
     ) -> Result<Self> {
         let request = proto::requests::ResourceLocator {
@@ -125,7 +125,7 @@ impl Session {
     }
 
     pub(crate) fn deletes_on_error(&self) -> bool {
-        self.policy == SessionErrorPolicy::Delete
+        self.policy == SessionLevelErrorPolicy::Delete
     }
 
     pub(crate) fn sequence(&self) -> &str {
@@ -172,7 +172,7 @@ impl Session {
 
     pub(super) async fn abort(self, reason: &str, topics: &[Arc<TopicState>]) -> Result<()> {
         match self.policy {
-            SessionErrorPolicy::Report => {
+            SessionLevelErrorPolicy::Report => {
                 let message = format!(
                     "session {} of sequence '{}' failed: {reason}",
                     self.locator, self.sequence
@@ -195,7 +195,7 @@ impl Session {
                     Err(error) => Err(error.session_left_open()),
                 }
             }
-            SessionErrorPolicy::Delete => {
+            SessionLevelErrorPolicy::Delete => {
                 let deleted = self.delete().await.map_err(Error::session_left_open);
                 if !self.owns_sequence {
                     return deleted;
@@ -316,7 +316,7 @@ fn refused_topic(refusal: &Error, session: &str, failed: &[(&str, Error, bool)])
 
 #[cfg(test)]
 impl Session {
-    pub(crate) fn offline(policy: SessionErrorPolicy) -> Self {
+    pub(crate) fn offline(policy: SessionLevelErrorPolicy) -> Self {
         let connection = Connection::offline(1 << 20);
         Self {
             scope: connection.scope().child(),
@@ -342,7 +342,7 @@ impl Drop for Session {
 mod tests {
     use super::*;
 
-    fn offline_session(policy: SessionErrorPolicy) -> Session {
+    fn offline_session(policy: SessionLevelErrorPolicy) -> Session {
         Session::offline(policy)
     }
 
@@ -392,7 +392,10 @@ mod tests {
 
     #[tokio::test]
     async fn failed_abort_left_open() {
-        for policy in [SessionErrorPolicy::Report, SessionErrorPolicy::Delete] {
+        for policy in [
+            SessionLevelErrorPolicy::Report,
+            SessionLevelErrorPolicy::Delete,
+        ] {
             let error = offline_session(policy)
                 .abort("boom", &[])
                 .await
@@ -423,7 +426,7 @@ mod tests {
 
     #[tokio::test]
     async fn drop_closes_topics() {
-        let session = offline_session(SessionErrorPolicy::Report);
+        let session = offline_session(SessionLevelErrorPolicy::Report);
         let client = session.connection.clone();
         let topic = session.scope.token();
         drop(session);

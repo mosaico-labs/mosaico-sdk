@@ -3,7 +3,7 @@ use prost::Message;
 use crate::comm::connection::Connection;
 use crate::comm::proto;
 use crate::error::{Error, ErrorKind, Result};
-use crate::locator::{sequence_name, topic_name};
+use crate::locator::{self, sequence_name};
 use crate::read::topic::{TopicHandler, flight_info, topic_in_sequence};
 use crate::scope::Scope;
 
@@ -11,8 +11,8 @@ use crate::scope::Scope;
 #[non_exhaustive]
 pub struct SessionInfo {
     pub locator: String,
-    pub created_at_ns: i64,
-    pub completed_at_ns: Option<i64>,
+    pub created_timestamp: i64,
+    pub completed_timestamp: Option<i64>,
     pub topics: Vec<String>,
     pub locked: bool,
 }
@@ -22,7 +22,7 @@ pub struct SequenceHandler {
     connection: Connection,
     scope: Scope,
     name: String,
-    created_at_ns: i64,
+    created_timestamp: i64,
     user_metadata: Option<String>,
     sessions: Vec<SessionInfo>,
     topics: Vec<TopicHandler>,
@@ -51,8 +51,8 @@ impl SequenceHandler {
             .map(|s| -> Result<SessionInfo> {
                 Ok(SessionInfo {
                     locator: s.locator,
-                    created_at_ns: s.created_at_ns,
-                    completed_at_ns: s.completed_at_ns,
+                    created_timestamp: s.created_at_ns,
+                    completed_timestamp: s.completed_at_ns,
                     topics: s
                         .topics
                         .iter()
@@ -73,7 +73,7 @@ impl SequenceHandler {
             connection: connection.clone(),
             scope,
             name: name.to_owned(),
-            created_at_ns: meta.created_at_ns,
+            created_timestamp: meta.created_at_ns,
             user_metadata,
             sessions,
             topics,
@@ -84,8 +84,8 @@ impl SequenceHandler {
         &self.name
     }
 
-    pub fn created_at_ns(&self) -> i64 {
-        self.created_at_ns
+    pub fn created_timestamp(&self) -> i64 {
+        self.created_timestamp
     }
 
     pub fn user_metadata(&self) -> Option<&str> {
@@ -114,9 +114,9 @@ impl SequenceHandler {
             .max()
     }
 
-    pub fn topic_handler(&self, topic: &str) -> Result<TopicHandler> {
+    pub fn topic_handler(&self, topic_name: &str) -> Result<TopicHandler> {
         self.connection.ensure_open()?;
-        let topic = topic_name(topic);
+        let topic = locator::topic_name(topic_name);
         self.topics
             .iter()
             .find(|t| t.name() == topic)

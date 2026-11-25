@@ -108,8 +108,8 @@ class MosaicoClient:
     def sequence_handler(self, sequence_name: str) -> SequenceHandler:
         return SequenceHandler(self._core, self._core.sequence_handler(sequence_name))
 
-    def topic_handler(self, sequence_name: str, topic_name: str, *, ontology: type[T]) -> TopicHandler[T]:
-        return open_topic(lambda: self._core.topic_handler(sequence_name, topic_name), ontology)
+    def topic_handler(self, sequence_name: str, topic_name: str, *, ontology_type: type[T]) -> TopicHandler[T]:
+        return open_topic(lambda: self._core.topic_handler(sequence_name, topic_name), ontology_type)
 
     def sequence_create(
         self,

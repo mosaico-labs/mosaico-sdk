@@ -25,8 +25,8 @@ S = TypeVar("S", bound=Serializable)
 @dataclass(frozen=True)
 class SessionInfo:
     locator: str
-    created_at_ns: int
-    completed_at_ns: int | None
+    created_timestamp: int
+    completed_timestamp: int | None
     topics: list[str]
     locked: bool
 
@@ -56,7 +56,7 @@ class SequenceHandler:
 
     @property
     def created_timestamp(self) -> int:
-        return self._core.created_at_ns
+        return self._core.created_timestamp
 
     @property
     def timestamp_ns_min(self) -> int | None:
@@ -66,8 +66,8 @@ class SequenceHandler:
     def timestamp_ns_max(self) -> int | None:
         return self._core.timestamp_ns_max
 
-    def topic_handler(self, topic_name: str, *, ontology: type[T]) -> TopicHandler[T]:
-        return open_topic(lambda: self._core.topic_handler(topic_name), ontology)
+    def topic_handler(self, topic_name: str, *, ontology_type: type[T]) -> TopicHandler[T]:
+        return open_topic(lambda: self._core.topic_handler(topic_name), ontology_type)
 
     def update(self, on_error: SessionLevelErrorPolicy = SessionLevelErrorPolicy.Report) -> SequenceUpdater:
         from ._writer import SequenceUpdater
@@ -78,14 +78,14 @@ class SequenceHandler:
         self._core.close()
 
 
-def open_topic(open_core: Callable[[], _core.TopicHandler], ontology: type[T]) -> TopicHandler[T]:
-    tag = check_ontology(ontology).__ontology_tag__
+def open_topic(open_core: Callable[[], _core.TopicHandler], ontology_type: type[T]) -> TopicHandler[T]:
+    tag = check_ontology(ontology_type).__ontology_tag__
     core = open_core()
     if core.ontology_tag != tag:
         raise OntologyMismatchError(
-            f"topic '{core.sequence}{core.name}' holds {core.ontology_tag!r} data, not {tag!r}"
+            f"topic '{core.sequence_name}{core.name}' holds {core.ontology_tag!r} data, not {tag!r}"
         )
-    return TopicHandler(core, ontology)
+    return TopicHandler(core, ontology_type)
 
 
 class TopicHandler(Generic[T]):
@@ -100,7 +100,7 @@ class TopicHandler(Generic[T]):
 
     @property
     def sequence_name(self) -> str:
-        return self._core.sequence
+        return self._core.sequence_name
 
     @property
     def ontology_tag(self) -> str:

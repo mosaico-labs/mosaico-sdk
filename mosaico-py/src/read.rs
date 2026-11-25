@@ -20,8 +20,8 @@ impl SequenceHandler {
     }
 
     #[getter]
-    fn created_at_ns(&self) -> PyResult<i64> {
-        Ok(self.0.get()?.created_at_ns())
+    fn created_timestamp(&self) -> PyResult<i64> {
+        Ok(self.0.get()?.created_timestamp())
     }
 
     #[getter]
@@ -39,8 +39,8 @@ impl SequenceHandler {
             .map(|s| {
                 (
                     s.locator.clone(),
-                    s.created_at_ns,
-                    s.completed_at_ns,
+                    s.created_timestamp,
+                    s.completed_timestamp,
                     s.topics.clone(),
                     s.locked,
                 )
@@ -80,8 +80,8 @@ pub(crate) struct TopicHandler(pub(crate) ProcessBound<mosaico_core::TopicHandle
 #[pymethods]
 impl TopicHandler {
     #[getter]
-    fn sequence(&self) -> PyResult<String> {
-        Ok(self.0.get()?.sequence().to_owned())
+    fn sequence_name(&self) -> PyResult<String> {
+        Ok(self.0.get()?.sequence_name().to_owned())
     }
 
     #[getter]
@@ -104,15 +104,18 @@ impl TopicHandler {
         Ok(self.0.get()?.timestamp_ns_max())
     }
 
-    #[pyo3(signature = (start_ns = None, end_ns = None))]
+    #[pyo3(signature = (start_timestamp_ns = None, end_timestamp_ns = None))]
     fn get_batch_streamer(
         &self,
         py: Python<'_>,
-        start_ns: Option<i64>,
-        end_ns: Option<i64>,
+        start_timestamp_ns: Option<i64>,
+        end_timestamp_ns: Option<i64>,
     ) -> PyResult<BatchStream> {
         let handler = self.0.get()?;
-        let streamer = run(py, handler.get_batch_streamer(start_ns, end_ns))?;
+        let streamer = run(
+            py,
+            handler.get_batch_streamer(start_timestamp_ns, end_timestamp_ns),
+        )?;
         Ok(BatchStream {
             schema: streamer.schema().clone(),
             handle: ProcessBound::new(streamer.close_handle()),
@@ -130,7 +133,7 @@ impl TopicHandler {
 pub(crate) struct BatchStream {
     schema: SchemaRef,
     handle: ProcessBound<mosaico_core::CloseHandle>,
-    inner: ProcessBound<Mutex<Option<mosaico_core::BatchStreamer>>>,
+    inner: ProcessBound<Mutex<Option<mosaico_core::TopicBatchStreamer>>>,
 }
 
 #[pymethods]

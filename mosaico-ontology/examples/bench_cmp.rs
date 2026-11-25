@@ -11,8 +11,8 @@ use arrow_array::{
 use arrow_ipc::reader::FileReader;
 use arrow_select::concat::concat_batches;
 use mosaico_core::{
-    ConnectOptions, Encode, Format, MosaicoClient, Ontology, SessionErrorPolicy, TopicErrorPolicy,
-    TopicHandler,
+    ConnectOptions, Encode, Format, MosaicoClient, Ontology, SessionLevelErrorPolicy, TopicHandler,
+    TopicLevelErrorPolicy,
 };
 use mosaico_ontology::{
     CompressedImage, Image, Imu, Pixels, decode_png, decode_png_batch, decode_png_batches,
@@ -163,7 +163,7 @@ async fn write(
     let started = Instant::now();
     let cpu = cpu_secs();
     let mut seq = client
-        .sequence_create(&sequence, None, SessionErrorPolicy::Delete)
+        .sequence_create(&sequence, None, SessionLevelErrorPolicy::Delete)
         .await?;
     let result = async {
         let writer = seq
@@ -173,7 +173,7 @@ async fn write(
                 format,
                 table.schema(),
                 None,
-                TopicErrorPolicy::Raise,
+                TopicLevelErrorPolicy::Raise,
             )
             .await?;
         let mut data_bytes = 0;
@@ -226,11 +226,11 @@ async fn write_push<T: Encode>(kind_name: &str, rows: usize) -> Result<String, B
     let started = Instant::now();
     let cpu = cpu_secs();
     let mut seq = client
-        .sequence_create(&sequence, None, SessionErrorPolicy::Delete)
+        .sequence_create(&sequence, None, SessionLevelErrorPolicy::Delete)
         .await?;
     let result = async {
         let writer = seq
-            .topic_create_for::<T>(topic, None, TopicErrorPolicy::Raise)
+            .topic_create_for::<T>(topic, None, TopicLevelErrorPolicy::Raise)
             .await?;
         for (timestamp_ns, value) in &messages {
             writer.push(*timestamp_ns, value).await?;
@@ -268,13 +268,20 @@ async fn write_multi(variant: &str) -> Result<String, Box<dyn Error>> {
     let started = Instant::now();
     let cpu = cpu_secs();
     let mut seq = client
-        .sequence_create(&sequence, None, SessionErrorPolicy::Delete)
+        .sequence_create(&sequence, None, SessionLevelErrorPolicy::Delete)
         .await?;
     let result = async {
         let mut work = Vec::new();
         for (topic, tag, format, schema, batches) in plans {
             let writer = seq
-                .topic_create(&topic, tag, format, schema, None, TopicErrorPolicy::Raise)
+                .topic_create(
+                    &topic,
+                    tag,
+                    format,
+                    schema,
+                    None,
+                    TopicLevelErrorPolicy::Raise,
+                )
                 .await?;
             work.push((writer, batches));
         }
@@ -327,7 +334,7 @@ async fn rows<T: Ontology>(
     let mut streamer = handler.get_data_streamer::<T>(start, end).await?;
     let (mut count, mut acc) = (0u64, 0.0);
     while let Some(msg) = streamer.next().await? {
-        acc += touch(&msg.view)?;
+        acc += touch(&msg.data)?;
         count += 1;
     }
     Ok((count, acc))

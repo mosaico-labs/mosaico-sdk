@@ -26,13 +26,13 @@ impl CloseHandle {
     }
 }
 
-pub struct BatchStreamer {
+pub struct TopicBatchStreamer {
     schema: SchemaRef,
     source: Option<Source>,
     token: Arc<Token>,
 }
 
-impl BatchStreamer {
+impl TopicBatchStreamer {
     pub(crate) fn single(reader: BatchReader, token: Arc<Token>) -> Self {
         Self {
             schema: reader.schema().clone(),

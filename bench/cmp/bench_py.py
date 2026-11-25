@@ -228,7 +228,7 @@ def read(client_name: str, kind: str, sequence: str, op: str, bounds: list[str])
                         acc += touch(kind, msg.data)
                     count += 1
         else:
-            handler = client.topic_handler(sequence, topic, ontology=cls)
+            handler = client.topic_handler(sequence, topic, ontology_type=cls)
             for start, end in ranges:
                 if op in ("rows", "windows"):
                     for msg in handler.get_data_streamer(start, end):

@@ -77,11 +77,6 @@ class _SessionWriter:
         return self._status
 
     @property
-    def session_status(self) -> SessionStatus:
-        self._started()
-        return self._status
-
-    @property
     def session_locator(self) -> str:
         self._started()
         return self._locator
@@ -177,7 +172,7 @@ class _SessionWriter:
             self._topics[writer.name] = topic
         return topic
 
-    def get_topic_writer(self, topic_name: str) -> TopicWriter:
+    def topic_writer(self, topic_name: str) -> TopicWriter:
         self._started()
         key = _core.topic_name(topic_name)
         with self._lock:
@@ -281,7 +276,7 @@ class TopicWriter:
 
     @property
     def dropped_record_count(self) -> int:
-        return self._core.dropped_records
+        return self._core.dropped_record_count
 
     def push(self, message: Message) -> None:
         if not isinstance(message, Message):
@@ -350,7 +345,7 @@ class TopicWriter:
         if self._dropped_warned:
             return
         try:
-            dropped = self._core.dropped_records
+            dropped = self._core.dropped_record_count
         except Exception:
             return
         if dropped:
