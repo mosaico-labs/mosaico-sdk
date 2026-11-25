@@ -1,7 +1,7 @@
 from mosaicolabs import IMU, Message, MosaicoClient, Vector3d
 
 with MosaicoClient.connect("localhost", 6726) as client:
-    src = client.topic_handler("mission_alpha", "/front/imu", ontology=IMU)
+    src = client.topic_handler("mission_alpha", "/front/imu", ontology_type=IMU)
 
     with client.sequence_create("mission_beta", {"vehicle": "rover_1"}) as seq:
         imu = seq.topic_create("/front/imu", {"rate_hz": 100}, IMU)

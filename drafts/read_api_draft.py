@@ -2,7 +2,7 @@ from mosaicolabs import MosaicoClient, QueryOntologyCatalog, IMU
 
 with MosaicoClient.connect("localhost", 6726) as client:
     seq = client.sequence_handler("mission_alpha")
-    imu = seq.topic_handler("/front/imu", ontology=IMU)
+    imu = seq.topic_handler("/front/imu", ontology_type=IMU)
     t0 = imu.timestamp_ns_min
     if t0 is None:
         raise RuntimeError("no time range: topic empty or not finalized")
