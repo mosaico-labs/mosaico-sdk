@@ -1,9 +1,11 @@
+use futures::future::try_join_all;
 use prost::Message;
 
 use crate::comm::connection::Connection;
 use crate::comm::proto;
 use crate::error::{Error, ErrorKind, Result};
 use crate::locator::{self, sequence_name};
+use crate::read::sequence_streamer::SequenceDataStreamer;
 use crate::read::topic::{TopicHandler, flight_info, topic_in_sequence};
 use crate::scope::Scope;
 
@@ -129,7 +131,115 @@ impl SequenceHandler {
             })
     }
 
+    pub async fn get_data_streamer(
+        &self,
+        topics: &[&str],
+        start_timestamp_ns: Option<i64>,
+        end_timestamp_ns: Option<i64>,
+    ) -> Result<SequenceDataStreamer> {
+        self.connection.ensure_open()?;
+        let topics = self.select(topics)?;
+        let streams = try_join_all(
+            topics
+                .iter()
+                .map(|t| t.get_batch_streamer(start_timestamp_ns, end_timestamp_ns)),
+        )
+        .await?;
+        SequenceDataStreamer::new(topics, streams)
+    }
+
     pub fn close(&self) {
         self.scope.close();
+    }
+
+    fn select(&self, names: &[&str]) -> Result<Vec<TopicHandler>> {
+        if names.is_empty() {
+            return Ok(self.topics.clone());
+        }
+        let mut selected: Vec<TopicHandler> = Vec::with_capacity(names.len());
+        for name in names {
+            let wanted = locator::topic_name(name);
+            let Some(topic) = self.topics.iter().find(|t| t.name() == wanted) else {
+                let known = self.topics().collect::<Vec<_>>().join(", ");
+                return Err(Error::new(
+                    ErrorKind::NotFound,
+                    format!(
+                        "topic '{}{wanted}' not found; topics in the sequence: {known}",
+                        self.name
+                    ),
+                ));
+            };
+            if selected.iter().any(|t| t.name() == wanted) {
+                return Err(Error::new(
+                    ErrorKind::InvalidArgument,
+                    format!("topic '{wanted}' given twice"),
+                ));
+            }
+            selected.push(topic.clone());
+        }
+        Ok(selected)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn offline(names: &[&str]) -> SequenceHandler {
+        let connection = Connection::offline(1 << 20);
+        let scope = connection.scope().child();
+        let topics = names
+            .iter()
+            .map(|n| TopicHandler::offline(&connection, scope.child(), "seq", n, "Value"))
+            .collect();
+        SequenceHandler {
+            connection,
+            scope,
+            name: "seq".to_owned(),
+            created_timestamp: 0,
+            user_metadata: None,
+            sessions: Vec::new(),
+            topics,
+        }
+    }
+
+    fn names(topics: &[TopicHandler]) -> Vec<&str> {
+        topics.iter().map(|t| t.name()).collect()
+    }
+
+    #[tokio::test]
+    async fn select_all_when_empty() {
+        let seq = offline(&["/a", "/b", "/c"]);
+        assert_eq!(names(&seq.select(&[]).unwrap()), ["/a", "/b", "/c"]);
+    }
+
+    #[tokio::test]
+    async fn select_keeps_order() {
+        let seq = offline(&["/a", "/b", "/c"]);
+        assert_eq!(names(&seq.select(&["c", "/a"]).unwrap()), ["/c", "/a"]);
+    }
+
+    #[tokio::test]
+    async fn select_unknown_topic() {
+        let seq = offline(&["/a", "/b"]);
+        let error = seq.select(&["/a", "/x"]).err().unwrap();
+        assert_eq!(error.kind(), ErrorKind::NotFound);
+        assert!(error.to_string().contains("seq/x"));
+        assert!(error.to_string().contains("/a, /b"));
+    }
+
+    #[tokio::test]
+    async fn select_twice_refused() {
+        let seq = offline(&["/a", "/b"]);
+        let error = seq.select(&["/a", "a"]).err().unwrap();
+        assert_eq!(error.kind(), ErrorKind::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn closed_client_refused() {
+        let seq = offline(&["/a"]);
+        seq.connection.scope().close();
+        let error = seq.get_data_streamer(&[], None, None).await.err().unwrap();
+        assert_eq!(error.kind(), ErrorKind::Closed);
     }
 }

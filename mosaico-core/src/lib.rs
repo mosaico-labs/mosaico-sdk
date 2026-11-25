@@ -14,6 +14,7 @@ pub use locator::topic_name;
 pub use ontology::{Encode, Format, Message, Ontology, RecordBuilder};
 pub use read::data_streamer::TopicDataStreamer;
 pub use read::sequence::{SequenceHandler, SessionInfo};
+pub use read::sequence_streamer::{RowRef, SequenceDataStreamer};
 pub use read::streamer::{CloseHandle, TopicBatchStreamer};
 pub use read::topic::TopicHandler;
 pub use write::rows::record_schema;

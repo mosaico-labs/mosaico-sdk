@@ -38,6 +38,10 @@ impl Token {
         self.cancel.cancel();
     }
 
+    pub(crate) async fn closed(&self) {
+        self.cancel.cancelled().await;
+    }
+
     pub(crate) async fn run_until_closed<F: Future>(&self, future: F) -> Option<F::Output> {
         self.cancel.run_until_cancelled(future).await
     }

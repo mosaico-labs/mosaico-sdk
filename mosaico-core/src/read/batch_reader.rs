@@ -131,9 +131,11 @@ pub(crate) mod testing {
     use arrow_schema::SchemaRef;
     use futures::stream::{self, BoxStream, StreamExt};
 
+    use std::sync::Arc;
+
     use super::BatchReader;
-    use crate::read::streamer::TopicBatchStreamer;
-    use crate::scope::Scope;
+    use crate::read::streamer::{ReadInfo, TopicBatchStreamer};
+    use crate::scope::{Scope, Token};
 
     pub(crate) enum Tail {
         End,
@@ -146,6 +148,44 @@ pub(crate) mod testing {
         batches: Vec<RecordBatch>,
         tail: Tail,
     ) -> TopicBatchStreamer {
+        streamer_with(
+            schema,
+            batches,
+            tail,
+            ReadInfo::default(),
+            Scope::root().token(),
+        )
+        .await
+    }
+
+    pub(crate) async fn delayed(
+        schema: SchemaRef,
+        batches: Vec<RecordBatch>,
+        delay: std::time::Duration,
+    ) -> TopicBatchStreamer {
+        let encoded = FlightDataEncoderBuilder::new()
+            .with_schema(schema)
+            .build(stream::iter(batches.into_iter().map(Ok)))
+            .enumerate()
+            .then(move |(i, item)| async move {
+                if i == 1 {
+                    tokio::time::sleep(delay).await;
+                }
+                item
+            });
+        let token = Scope::root().token();
+        let decoder = FlightDataDecoder::new(encoded);
+        let reader = BatchReader::start(decoder, token.clone()).await.unwrap();
+        TopicBatchStreamer::single(reader, ReadInfo::default(), token)
+    }
+
+    pub(crate) async fn streamer_with(
+        schema: SchemaRef,
+        batches: Vec<RecordBatch>,
+        tail: Tail,
+        info: ReadInfo,
+        token: Arc<Token>,
+    ) -> TopicBatchStreamer {
         let encoded = FlightDataEncoderBuilder::new()
             .with_schema(schema)
             .build(stream::iter(batches.into_iter().map(Ok)));
@@ -156,9 +196,8 @@ pub(crate) mod testing {
             }
             Tail::Hang => stream::pending().boxed(),
         };
-        let token = Scope::root().token();
         let decoder = FlightDataDecoder::new(encoded.chain(tail));
         let reader = BatchReader::start(decoder, token.clone()).await.unwrap();
-        TopicBatchStreamer::single(reader, token)
+        TopicBatchStreamer::single(reader, info, token)
     }
 }

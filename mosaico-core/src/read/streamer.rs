@@ -5,13 +5,7 @@ use arrow_schema::{Schema, SchemaRef};
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::read::batch_reader::BatchReader;
-use crate::read::multi_reader::MultiReader;
 use crate::scope::Token;
-
-enum Source {
-    Single(BatchReader),
-    Parallel(MultiReader),
-}
 
 #[derive(Clone)]
 pub struct CloseHandle(Arc<Token>);
@@ -26,17 +20,26 @@ impl CloseHandle {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ReadInfo {
+    pub(crate) msg_count: u64,
+    pub(crate) timestamp_ns_min: Option<i64>,
+    pub(crate) timestamp_ns_max: Option<i64>,
+}
+
 pub struct TopicBatchStreamer {
     schema: SchemaRef,
-    source: Option<Source>,
+    source: Option<BatchReader>,
+    info: ReadInfo,
     token: Arc<Token>,
 }
 
 impl TopicBatchStreamer {
-    pub(crate) fn single(reader: BatchReader, token: Arc<Token>) -> Self {
+    pub(crate) fn single(reader: BatchReader, info: ReadInfo, token: Arc<Token>) -> Self {
         Self {
             schema: reader.schema().clone(),
-            source: Some(Source::Single(reader)),
+            source: Some(reader),
+            info,
             token,
         }
     }
@@ -45,14 +48,7 @@ impl TopicBatchStreamer {
         Self {
             schema: Arc::new(Schema::empty()),
             source: None,
-            token,
-        }
-    }
-
-    pub(crate) fn parallel(schema: SchemaRef, reader: MultiReader, token: Arc<Token>) -> Self {
-        Self {
-            schema,
-            source: Some(Source::Parallel(reader)),
+            info: ReadInfo::default(),
             token,
         }
     }
@@ -65,15 +61,32 @@ impl TopicBatchStreamer {
         &self.schema
     }
 
+    pub fn msg_count(&self) -> u64 {
+        self.info.msg_count
+    }
+
+    pub fn timestamp_ns_min(&self) -> Option<i64> {
+        self.info.timestamp_ns_min
+    }
+
+    pub fn timestamp_ns_max(&self) -> Option<i64> {
+        self.info.timestamp_ns_max
+    }
+
+    pub(crate) fn info(&self) -> ReadInfo {
+        self.info
+    }
+
+    pub(crate) fn token(&self) -> Arc<Token> {
+        self.token.clone()
+    }
+
     pub async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         self.ensure_open()?;
         let Some(source) = self.source.as_mut() else {
             return Ok(None);
         };
-        let item = match source {
-            Source::Single(reader) => reader.next_batch().await,
-            Source::Parallel(reader) => reader.next_batch().await,
-        };
+        let item = source.next_batch().await;
         match &item {
             Ok(Some(_)) => {}
             Ok(None) => {

@@ -12,7 +12,7 @@ use crate::locator::{sequence_name, topic_name};
 use crate::ontology::Ontology;
 use crate::read::batch_reader::BatchReader;
 use crate::read::data_streamer::TopicDataStreamer;
-use crate::read::streamer::TopicBatchStreamer;
+use crate::read::streamer::{ReadInfo, TopicBatchStreamer};
 use crate::scope::{Scope, Token};
 
 #[derive(Clone)]
@@ -22,8 +22,8 @@ pub struct TopicHandler {
     sequence: String,
     name: String,
     ontology_tag: String,
-    timestamp_ns_min: Option<i64>,
-    timestamp_ns_max: Option<i64>,
+    info: ReadInfo,
+    window: Option<ReadInfo>,
     ticket: Option<Ticket>,
 }
 
@@ -55,14 +55,26 @@ impl TopicHandler {
             .data_info
             .ok_or_else(|| protocol(&meta.locator, "metadata without data_info"))?;
         let interval = data_info.interval.unwrap_or_default();
+        let window = meta.time_window_info.map(|w| {
+            let interval = w.interval.unwrap_or_default();
+            ReadInfo {
+                msg_count: w.row_count,
+                timestamp_ns_min: interval.start_ns,
+                timestamp_ns_max: interval.end_ns,
+            }
+        });
         Ok(Self {
             connection: connection.clone(),
             scope,
             sequence: sequence.to_owned(),
             name,
             ontology_tag: meta.ontology_tag,
-            timestamp_ns_min: interval.start_ns,
-            timestamp_ns_max: interval.end_ns,
+            info: ReadInfo {
+                msg_count: data_info.total_row_count,
+                timestamp_ns_min: interval.start_ns,
+                timestamp_ns_max: interval.end_ns,
+            },
+            window,
             ticket: endpoint
                 .ticket
                 .clone()
@@ -102,11 +114,15 @@ impl TopicHandler {
     }
 
     pub fn timestamp_ns_min(&self) -> Option<i64> {
-        self.timestamp_ns_min
+        self.info.timestamp_ns_min
     }
 
     pub fn timestamp_ns_max(&self) -> Option<i64> {
-        self.timestamp_ns_max
+        self.info.timestamp_ns_max
+    }
+
+    pub fn msg_count(&self) -> u64 {
+        self.info.msg_count
     }
 
     pub async fn get_batch_streamer(
@@ -139,9 +155,13 @@ impl TopicHandler {
                 end_ns: end_timestamp_ns,
             },
         );
-        let ticket = match (&self.ticket, range) {
-            (Some(ticket), None) => Some(ticket.clone()),
-            (_, range) => self.refetch(range).await?.ticket,
+        let (ticket, info) = match (&self.ticket, range) {
+            (Some(ticket), None) => (Some(ticket.clone()), self.info),
+            (_, range) => {
+                let fresh = self.refetch(range).await?;
+                let info = fresh.window.unwrap_or(fresh.info);
+                (fresh.ticket, info)
+            }
         };
         let Some(ticket) = ticket else {
             return Ok(TopicBatchStreamer::empty(token));
@@ -149,7 +169,7 @@ impl TopicHandler {
         let reader = BatchReader::open(&self.connection, ticket, token.clone())
             .await
             .map_err(|e| e.or_not_found(|| format!("topic '{locator}' not found")))?;
-        Ok(TopicBatchStreamer::single(reader, token))
+        Ok(TopicBatchStreamer::single(reader, info, token))
     }
 
     pub async fn get_data_streamer<T: Ontology>(
@@ -234,4 +254,30 @@ pub(crate) async fn flight_info(
 
 fn protocol(locator: &str, problem: &str) -> Error {
     Error::new(ErrorKind::Protocol, format!("topic '{locator}': {problem}"))
+}
+
+#[cfg(test)]
+impl TopicHandler {
+    pub(crate) fn offline(
+        connection: &Connection,
+        scope: Scope,
+        sequence: &str,
+        name: &str,
+        ontology_tag: &str,
+    ) -> Self {
+        Self {
+            connection: connection.clone(),
+            scope,
+            sequence: sequence.to_owned(),
+            name: name.to_owned(),
+            ontology_tag: ontology_tag.to_owned(),
+            info: ReadInfo::default(),
+            window: None,
+            ticket: None,
+        }
+    }
+
+    pub(crate) fn token(&self) -> Arc<Token> {
+        self.scope.token()
+    }
 }

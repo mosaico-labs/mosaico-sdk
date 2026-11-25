@@ -63,13 +63,25 @@ impl<T: Ontology> TopicDataStreamer<T> {
         }))
     }
 
+    pub fn msg_count(&self) -> u64 {
+        self.batches.msg_count()
+    }
+
+    pub fn timestamp_ns_min(&self) -> Option<i64> {
+        self.batches.timestamp_ns_min()
+    }
+
+    pub fn timestamp_ns_max(&self) -> Option<i64> {
+        self.batches.timestamp_ns_max()
+    }
+
     pub fn close(&mut self) {
         self.batches.close();
         self.current = None;
     }
 }
 
-fn read_batch<T: Ontology>(batch: &RecordBatch) -> Result<Current<T>> {
+pub(crate) fn timestamps(batch: &RecordBatch) -> Result<Int64Array> {
     let timestamps = batch
         .column_by_name(TIMESTAMP_COLUMN)
         .and_then(|c| c.as_primitive_opt::<Int64Type>())
@@ -77,8 +89,12 @@ fn read_batch<T: Ontology>(batch: &RecordBatch) -> Result<Current<T>> {
     if timestamps.null_count() > 0 {
         return Err(Error::schema(format!("null in column {TIMESTAMP_COLUMN}")));
     }
+    Ok(timestamps.clone())
+}
+
+fn read_batch<T: Ontology>(batch: &RecordBatch) -> Result<Current<T>> {
     Ok(Current {
-        timestamps: timestamps.clone(),
+        timestamps: timestamps(batch)?,
         columns: T::columns(batch)?,
         row: 0,
     })
