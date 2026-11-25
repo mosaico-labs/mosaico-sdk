@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import operator
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any, get_args
@@ -10,6 +11,16 @@ from pydantic import BaseModel
 
 from ._errors import InvalidArgumentError
 from ._views import Columns, IMUView, imu_model
+
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
+
+
+def is_int64(value: Any) -> bool:
+    try:
+        return _INT64_MIN <= operator.index(value) <= _INT64_MAX
+    except TypeError:
+        return False
 
 
 def check_ontology(ontology: object) -> type[Serializable]:

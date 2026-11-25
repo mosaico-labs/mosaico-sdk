@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import operator
 import threading
 from collections.abc import Iterator
 from types import TracebackType
@@ -23,7 +22,7 @@ from mosaicolabs import (
 
 from . import _core
 from ._errors import InvalidArgumentError, TopicNotFoundError
-from ._schema import check_ontology, wire_schema
+from ._schema import check_ontology, is_int64, wire_schema
 
 _TERMINAL = (TopicWriterStatus.Finalized, TopicWriterStatus.FinalizedWithError)
 _RECORD_KINDS: dict[type[Serializable], str] = {
@@ -31,8 +30,6 @@ _RECORD_KINDS: dict[type[Serializable], str] = {
     Image: "image",
     CompressedImage: "compressed_image",
 }
-_INT64_MIN = -(2**63)
-_INT64_MAX = 2**63 - 1
 _log = logging.getLogger(__name__)
 
 
@@ -55,13 +52,6 @@ def _timestamps(value: Any) -> pa.Array:
     if array.type != pa.int64():
         raise InvalidArgumentError(f"'timestamp_ns' must be int64, got '{array.type}'")
     return array
-
-
-def _is_int64(value: Any) -> bool:
-    try:
-        return _INT64_MIN <= operator.index(value) <= _INT64_MAX
-    except TypeError:
-        return False
 
 
 class _SessionWriter:
@@ -303,7 +293,7 @@ class TopicWriter:
                 f"message data is {type(data).__name__}, but topic '{self.name}' stores {self._ontology.__name__}"
             )
         timestamp = message.timestamp_ns
-        if not _is_int64(timestamp):
+        if not is_int64(timestamp):
             raise self._core.reject(f"'timestamp_ns' must be an int64, got {timestamp!r}")
         if self._kind is not None:
             self._core.push(self._kind, timestamp, data)

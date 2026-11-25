@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import operator
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar, overload
 
@@ -10,7 +12,7 @@ from mosaicolabs import Serializable, SessionLevelErrorPolicy
 
 from . import _core
 from ._errors import InvalidArgumentError, OntologyMismatchError, SchemaError, StreamClosedError
-from ._schema import SPECS, OntologySpec, check_ontology, conform, fill, schema_problem, served_schema
+from ._schema import SPECS, OntologySpec, check_ontology, conform, fill, is_int64, schema_problem, served_schema
 from ._views import columns
 
 if TYPE_CHECKING:
@@ -64,8 +66,8 @@ class SequenceHandler:
     def timestamp_ns_max(self) -> int | None:
         return self._core.timestamp_ns_max
 
-    def get_topic_handler(self, topic_name: str, *, ontology: type[T]) -> TopicHandler[T]:
-        return open_topic(self._core.topic_handler(topic_name), ontology)
+    def topic_handler(self, topic_name: str, *, ontology: type[T]) -> TopicHandler[T]:
+        return open_topic(lambda: self._core.topic_handler(topic_name), ontology)
 
     def update(self, on_error: SessionLevelErrorPolicy = SessionLevelErrorPolicy.Report) -> SequenceUpdater:
         from ._writer import SequenceUpdater
@@ -76,9 +78,9 @@ class SequenceHandler:
         self._core.close()
 
 
-def open_topic(core: _core.TopicHandler, ontology: type[T]) -> TopicHandler[T]:
-    checked = check_ontology(ontology)
-    tag = checked.__ontology_tag__
+def open_topic(open_core: Callable[[], _core.TopicHandler], ontology: type[T]) -> TopicHandler[T]:
+    tag = check_ontology(ontology).__ontology_tag__
+    core = open_core()
     if core.ontology_tag != tag:
         raise OntologyMismatchError(
             f"topic '{core.sequence}{core.name}' holds {core.ontology_tag!r} data, not {tag!r}"
@@ -168,7 +170,7 @@ class TopicHandler(Generic[T]):
         self._core.close()
 
     def _open(self, start: int | None, end: int | None) -> tuple[_core.BatchStream, pa.Schema, pa.Schema]:
-        stream = self._core.get_batch_streamer(start, end)
+        stream = self._core.get_batch_streamer(_bound("start_timestamp_ns", start), _bound("end_timestamp_ns", end))
         schema = pa.schema(stream.schema)  # pyright: ignore[reportArgumentType]
         if len(schema) == 0:
             expected = served_schema(self._ontology)
@@ -182,6 +184,14 @@ class TopicHandler(Generic[T]):
                 f"topic '{self.sequence_name}{self.name}' does not match {self._ontology.__name__}: {problem}"
             )
         return stream, schema, conform(self._spec.schema, schema)
+
+
+def _bound(label: str, value: Any) -> int | None:
+    if value is None:
+        return None
+    if not is_int64(value):
+        raise InvalidArgumentError(f"'{label}' must be an int64 or None, got {value!r}")
+    return operator.index(value)
 
 
 def _is_string(t: pa.DataType) -> bool:
