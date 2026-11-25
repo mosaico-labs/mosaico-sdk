@@ -92,3 +92,29 @@ impl Scope {
             .unwrap_or_else(PoisonError::into_inner)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn closed_scope_reopens() {
+        let root = Scope::root();
+        let handler = root.child();
+        let first = handler.token();
+        handler.close();
+        assert!(first.is_closed());
+        assert!(!handler.token().is_closed());
+        root.close();
+        assert!(handler.token().is_closed());
+    }
+
+    #[tokio::test]
+    async fn close_cancels_wait() {
+        let scope = Scope::root().child();
+        let token = scope.token();
+        scope.close();
+        let waited = token.run_until_closed(std::future::pending::<()>()).await;
+        assert!(waited.is_none());
+    }
+}

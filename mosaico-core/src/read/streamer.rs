@@ -101,3 +101,61 @@ impl BatchStreamer {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use arrow_array::Int64Array;
+    use arrow_schema::{DataType, Field};
+
+    use super::*;
+    use crate::read::batch_reader::testing::{Tail, streamer};
+
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new(
+            "timestamp_ns",
+            DataType::Int64,
+            false,
+        )]))
+    }
+
+    fn batch(values: &[i64]) -> RecordBatch {
+        RecordBatch::try_new(schema(), vec![Arc::new(Int64Array::from(values.to_vec()))]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn end_repeats() {
+        let mut stream = streamer(schema(), vec![batch(&[1, 2]), batch(&[3])], Tail::End).await;
+        assert_eq!(stream.next_batch().await.unwrap().unwrap().num_rows(), 2);
+        assert_eq!(stream.next_batch().await.unwrap().unwrap().num_rows(), 1);
+        assert!(stream.next_batch().await.unwrap().is_none());
+        assert!(stream.next_batch().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn error_then_closed() {
+        let mut stream = streamer(schema(), vec![batch(&[1])], Tail::Fail).await;
+        assert!(stream.next_batch().await.unwrap().is_some());
+        let failed = stream.next_batch().await.unwrap_err();
+        assert_eq!(failed.kind(), ErrorKind::Stream);
+        let closed = stream.next_batch().await.unwrap_err();
+        assert_eq!(closed.kind(), ErrorKind::Closed);
+    }
+
+    #[tokio::test]
+    async fn close_stops_wait() {
+        let mut stream = streamer(schema(), Vec::new(), Tail::Hang).await;
+        let handle = stream.close_handle();
+        let waiting = tokio::spawn(async move { stream.next_batch().await.map(|b| b.is_some()) });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiting.is_finished());
+        handle.close();
+        let ended = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ended.unwrap_err().kind(), ErrorKind::Closed);
+        assert!(handle.is_closed());
+    }
+}

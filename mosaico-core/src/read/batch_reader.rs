@@ -120,3 +120,45 @@ async fn forward_batches(
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) mod testing {
+    use arrow_array::RecordBatch;
+    use arrow_flight::FlightData;
+    use arrow_flight::decode::FlightDataDecoder;
+    use arrow_flight::encode::FlightDataEncoderBuilder;
+    use arrow_flight::error::FlightError;
+    use arrow_schema::SchemaRef;
+    use futures::stream::{self, BoxStream, StreamExt};
+
+    use super::BatchReader;
+    use crate::read::streamer::BatchStreamer;
+    use crate::scope::Scope;
+
+    pub(crate) enum Tail {
+        End,
+        Fail,
+        Hang,
+    }
+
+    pub(crate) async fn streamer(
+        schema: SchemaRef,
+        batches: Vec<RecordBatch>,
+        tail: Tail,
+    ) -> BatchStreamer {
+        let encoded = FlightDataEncoderBuilder::new()
+            .with_schema(schema)
+            .build(stream::iter(batches.into_iter().map(Ok)));
+        let tail: BoxStream<'static, Result<FlightData, FlightError>> = match tail {
+            Tail::End => stream::empty().boxed(),
+            Tail::Fail => {
+                stream::once(async { Err(FlightError::ProtocolError("cut".to_owned())) }).boxed()
+            }
+            Tail::Hang => stream::pending().boxed(),
+        };
+        let token = Scope::root().token();
+        let decoder = FlightDataDecoder::new(encoded.chain(tail));
+        let reader = BatchReader::start(decoder, token.clone()).await.unwrap();
+        BatchStreamer::single(reader, token)
+    }
+}
