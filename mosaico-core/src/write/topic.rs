@@ -1,22 +1,24 @@
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StateLock, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use arrow_array::{Array, Int64Array, RecordBatch};
 use futures::{Stream, StreamExt};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 
 use crate::comm::action::ActionKind;
+use crate::comm::budget::limits;
 use crate::comm::connection::Connection;
 use crate::error::{Error, ErrorKind, Result};
-use crate::ontology::Encode;
-use crate::write::batch_writer::BatchWriter;
+use crate::ontology::{Encode, Format};
+use crate::write::batch_writer::{BatchWriter, estimate};
 use crate::write::rows::{BatchRows, Chunk, Ready, RowBuffer, Rows};
 use crate::write::session::interrupted_error;
 
 pub(super) const TIMESTAMP: &str = "timestamp_ns";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TopicErrorPolicy {
     Raise,
     Finalize,
@@ -35,10 +37,28 @@ pub enum TopicWriterStatus {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FlushPolicy {
     pub max_bytes: Option<usize>,
     pub max_rows: Option<usize>,
     pub max_age: Option<Duration>,
+}
+
+impl FlushPolicy {
+    pub fn max_bytes(mut self, bytes: usize) -> Self {
+        self.max_bytes = Some(bytes);
+        self
+    }
+
+    pub fn max_rows(mut self, rows: usize) -> Self {
+        self.max_rows = Some(rows);
+        self
+    }
+
+    pub fn max_age(mut self, age: Duration) -> Self {
+        self.max_age = Some(age);
+        self
+    }
 }
 
 #[derive(Clone)]
@@ -52,51 +72,43 @@ impl TopicWriter {
     }
 
     pub fn name(&self) -> &str {
-        &self.topic.name
+        &self.topic.reporter.name
     }
 
     pub fn dropped_records(&self) -> u64 {
-        self.topic.status.dropped()
+        self.topic.reporter.status.dropped()
     }
 
     pub fn status(&self) -> TopicWriterStatus {
-        self.topic.status.lock().status
+        self.topic.reporter.status.lock().status
     }
 
     pub fn last_error(&self) -> Option<String> {
-        self.topic.status.lock().last_error.clone()
+        self.topic.reporter.status.lock().last_error.clone()
     }
 
     pub async fn push_batch(&self, batch: RecordBatch) -> Result<()> {
         let mut guard = self.topic.slot.lock().await;
-        let Some(slot) = guard.as_mut() else {
-            return Err(self.topic.finalized());
-        };
-        let result = self.topic.push_batch(slot, batch).await;
-        self.topic.record(result.as_ref().map(|()| true));
-        result
+        let slot = self.topic.open(&mut guard).await?;
+        let result = self.topic.push_batch(slot, batch).await.map(|()| true);
+        self.topic.settle(&mut guard, result).await.map(drop)
     }
 
     pub async fn push<T: Encode>(&self, timestamp_ns: i64, value: &T) -> Result<()> {
         let mut guard = self.topic.slot.lock().await;
-        let Some(slot) = guard.as_mut() else {
-            return Err(self.topic.finalized());
-        };
+        let slot = self.topic.open(&mut guard).await?;
         let result = self.topic.push_record(slot, timestamp_ns, value).await;
-        self.topic.record(result.as_ref().map(|sent| *sent));
-        result.map(drop)
+        self.topic.settle(&mut guard, result).await.map(drop)
     }
 
-    pub async fn push_row(&self, row: RecordBatch, size: usize) -> Result<()> {
+    pub async fn push_row(&self, row: RecordBatch) -> Result<()> {
         let mut guard = self.topic.slot.lock().await;
-        let Some(slot) = guard.as_mut() else {
-            return Err(self.topic.finalized());
-        };
-        let result = self.topic.push_row(slot, row, size).await;
-        self.topic.record(result.as_ref().map(|sent| *sent));
-        result.map(drop)
+        let slot = self.topic.open(&mut guard).await?;
+        let result = self.topic.push_row(slot, row).await;
+        self.topic.settle(&mut guard, result).await.map(drop)
     }
 
+    #[doc(hidden)]
     pub async fn reject(&self, error: Error) -> Error {
         let guard = self.topic.slot.lock().await;
         if guard.is_none() {
@@ -107,65 +119,72 @@ impl TopicWriter {
         error
     }
 
-    pub async fn handle_error(&self, reason: &str) -> bool {
+    pub async fn handle_error(&self, reason: &str) -> Result<bool> {
         let mut guard = self.topic.slot.lock().await;
         match self.topic.on_error {
             TopicErrorPolicy::Raise => {
-                self.topic
-                    .set_state(TopicWriterStatus::Raised, Some(reason.to_owned()));
-                false
+                if guard.is_some() {
+                    self.topic
+                        .set_state(TopicWriterStatus::Raised, Some(reason.to_owned()));
+                }
+                Ok(false)
             }
             TopicErrorPolicy::Ignore => {
-                self.topic.report(reason).await;
-                self.topic
-                    .set_state(TopicWriterStatus::IgnoredLastError, Some(reason.to_owned()));
-                true
+                if guard.is_some() {
+                    self.topic.reporter.report(reason).await;
+                    self.topic
+                        .set_state(TopicWriterStatus::IgnoredLastError, Some(reason.to_owned()));
+                }
+                Ok(true)
             }
             TopicErrorPolicy::Finalize => {
-                let Some(slot) = guard.take() else {
-                    return false;
-                };
-                self.topic.report(reason).await;
-                let _ = slot.writer.finish().await;
-                self.topic.set_state(
-                    TopicWriterStatus::FinalizedWithError,
-                    Some(reason.to_owned()),
-                );
-                true
+                if guard.is_none() {
+                    return Ok(false);
+                }
+                self.topic
+                    .close_slot(&mut guard, Close::Report(reason))
+                    .await
+                    .map(|()| true)
             }
         }
+    }
+
+    pub async fn finalize(&self, error: Option<&str>) -> Result<()> {
+        let close = match error {
+            Some(reason) => Close::Report(reason),
+            None => Close::Finish,
+        };
+        self.topic.close(close).await
     }
 
     pub async fn flush(&self) -> Result<()> {
         let mut guard = self.topic.slot.lock().await;
-        let Some(slot) = guard.as_mut() else {
-            return Err(self.topic.finalized());
-        };
+        let slot = self.topic.open(&mut guard).await?;
         let result = match self.topic.send_rows(slot, true).await {
             Ok(()) => slot.writer.flush().await,
             Err(error) => Err(error),
         };
-        if let Err(error) = &result {
-            self.topic
-                .set_state(TopicWriterStatus::Raised, Some(error.to_string()));
-        }
-        result
+        self.topic
+            .settle(&mut guard, result.map(|()| false))
+            .await?;
+        Ok(())
     }
 
     pub async fn set_flush_policy(&self, policy: FlushPolicy) -> Result<()> {
         let mut guard = self.topic.slot.lock().await;
-        let Some(slot) = guard.as_mut() else {
-            return Err(self.topic.finalized());
-        };
-        slot.writer.set_policy(policy)?;
+        let slot = self.topic.open(&mut guard).await?;
+        if let Err(error) = slot.writer.set_policy(policy) {
+            return self.topic.settle(&mut guard, Err(error)).await.map(drop);
+        }
         slot.policy = policy;
         let ready = slot.rows.as_ref().map_or(Ready::No, |rows| {
             rows.ready(&policy, slot.writer.target_bytes())
         });
-        match ready {
-            Ready::No => Ok(()),
-            Ready::Chunk | Ready::Policy => self.topic.send_rows(slot, true).await,
-        }
+        let result = match ready {
+            Ready::No => Ok(false),
+            Ready::Chunk | Ready::Policy => self.topic.send_rows(slot, true).await.map(|()| false),
+        };
+        self.topic.settle(&mut guard, result).await.map(drop)
     }
 
     pub async fn push_stream<S, E>(&self, batches: S) -> Result<()>
@@ -175,10 +194,14 @@ impl TopicWriter {
     {
         let mut batches = std::pin::pin!(batches);
         while let Some(batch) = batches.next().await {
-            let batch = batch.map_err(|e| {
-                Error::new(ErrorKind::InvalidArgument, "cannot read batch").with_source(e)
-            })?;
-            self.push_batch(batch).await?;
+            match batch {
+                Ok(batch) => self.push_batch(batch).await?,
+                Err(e) => {
+                    let error =
+                        Error::new(ErrorKind::InvalidArgument, "cannot read batch").with_source(e);
+                    return Err(self.reject(error).await);
+                }
+            }
         }
         Ok(())
     }
@@ -198,14 +221,67 @@ struct Slot {
     policy: FlushPolicy,
 }
 
-pub(super) struct TopicState {
+pub(crate) struct Reporter {
     name: String,
     locator: String,
     connection: Connection,
+    limit: usize,
+    status: Status,
+}
+
+impl Reporter {
+    pub(super) fn new(name: String, locator: String, connection: Connection) -> Self {
+        let (limit, _) = limits(connection.info());
+        Self {
+            name,
+            locator,
+            connection,
+            limit,
+            status: Status::new(),
+        }
+    }
+
+    pub(crate) fn locator(&self) -> &str {
+        &self.locator
+    }
+
+    pub(crate) async fn record_dropped(&self, count: u64, largest: usize, at_push: bool) {
+        let message = format!(
+            "{count} record(s) dropped for topic '{}': each is larger alone than the message size limit ({} bytes), the largest is {largest} bytes",
+            self.name, self.limit
+        );
+        self.status.record_dropped(count, message.clone(), at_push);
+        self.notify(message).await;
+    }
+
+    async fn report(&self, reason: &str) {
+        self.notify(format!("topic '{}' failed: {reason}", self.locator))
+            .await;
+    }
+
+    async fn notify(&self, message: String) {
+        let _ = self
+            .connection
+            .notify_error(ActionKind::TopicNotificationCreate, &self.locator, message)
+            .await;
+    }
+}
+
+pub(super) struct TopicState {
+    ontology_tag: String,
+    format: Format,
     on_error: TopicErrorPolicy,
-    status: Arc<Status>,
+    reporter: Arc<Reporter>,
     slot: Mutex<Option<Slot>>,
     last_timestamp: AtomicI64,
+    upload_failure: StateLock<Option<(Error, bool)>>,
+    closing: StateLock<Option<Closing>>,
+}
+
+struct Closing {
+    done: watch::Receiver<bool>,
+    outcome: Arc<StateLock<Option<Result<()>>>>,
+    end_sent: Arc<AtomicBool>,
 }
 
 pub(crate) struct Status {
@@ -234,20 +310,38 @@ impl Status {
     }
 
     fn set(&self, status: TopicWriterStatus, last_error: Option<String>) {
-        *self.lock() = State { status, last_error };
+        let mut state = self.lock();
+        if terminal(state.status) && !terminal(status) {
+            return;
+        }
+        *state = State { status, last_error };
+    }
+
+    fn close(&self) {
+        let mut state = self.lock();
+        if !terminal(state.status) {
+            *state = State {
+                status: TopicWriterStatus::Finalized,
+                last_error: None,
+            };
+        }
     }
 
     fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn record_dropped(&self, count: u64, message: String) {
+    fn record_dropped(&self, count: u64, message: String, at_push: bool) {
         self.dropped.fetch_add(count, Ordering::Relaxed);
         let mut state = self.lock();
-        if !matches!(
-            state.status,
-            TopicWriterStatus::Finalized | TopicWriterStatus::FinalizedWithError
-        ) {
+        let replace = match at_push {
+            true => !terminal(state.status),
+            false => matches!(
+                state.status,
+                TopicWriterStatus::Active | TopicWriterStatus::RecordTooLarge
+            ),
+        };
+        if replace {
             *state = State {
                 status: TopicWriterStatus::RecordTooLarge,
                 last_error: Some(message),
@@ -258,18 +352,17 @@ impl Status {
 
 impl TopicState {
     pub(super) fn new(
-        name: String,
-        locator: String,
-        connection: Connection,
+        ontology_tag: String,
+        format: Format,
         on_error: TopicErrorPolicy,
+        reporter: Arc<Reporter>,
         writer: BatchWriter,
     ) -> Self {
         Self {
-            name,
-            locator,
-            connection,
+            ontology_tag,
+            format,
             on_error,
-            status: writer.status(),
+            reporter,
             slot: Mutex::new(Some(Slot {
                 writer,
                 rows: None,
@@ -277,22 +370,151 @@ impl TopicState {
                 policy: FlushPolicy::default(),
             })),
             last_timestamp: AtomicI64::new(i64::MIN),
+            upload_failure: StateLock::new(None),
+            closing: StateLock::new(None),
         }
     }
 
     pub(super) fn name(&self) -> &str {
-        &self.name
+        &self.reporter.name
     }
 
-    fn finalized(&self) -> Error {
-        Error::new(
-            ErrorKind::Closed,
-            format!("topic '{}' is finalized", self.name),
+    pub(super) fn locator(&self) -> &str {
+        &self.reporter.locator
+    }
+
+    pub(super) fn upload_failure(&self) -> Option<Error> {
+        self.failed_upload().map(|(error, _)| error)
+    }
+
+    pub(super) fn failed_upload(&self) -> Option<(Error, bool)> {
+        self.upload_failure
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|(error, end_sent)| (error.duplicate(), *end_sent))
+    }
+
+    fn upload_error(&self, cause: Error, end_sent: bool) -> (Error, Option<String>) {
+        if cause.kind() == ErrorKind::Closed {
+            return (cause, None);
+        }
+        let reason = cause.to_string();
+        let error = Error::new(
+            cause.kind(),
+            format!("the upload of topic '{}' failed", self.reporter.name),
+        )
+        .with_source(cause);
+        *self
+            .upload_failure
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some((error.duplicate(), end_sent));
+        (
+            error,
+            (self.on_error != TopicErrorPolicy::Raise).then_some(reason),
         )
     }
 
+    fn start_closing(&self, writer: BatchWriter) {
+        let end_sent = writer.end_sent();
+        let outcome = Arc::new(StateLock::new(None));
+        let (finished, done) = watch::channel(false);
+        tokio::spawn({
+            let outcome = outcome.clone();
+            async move {
+                let result = writer.finish().await;
+                *outcome.lock().unwrap_or_else(PoisonError::into_inner) = Some(result);
+                finished.send_replace(true);
+            }
+        });
+        *self.closing.lock().unwrap_or_else(PoisonError::into_inner) = Some(Closing {
+            done,
+            outcome,
+            end_sent,
+        });
+    }
+
+    async fn closed(&self) -> Result<()> {
+        let mut done = match &*self.closing.lock().unwrap_or_else(PoisonError::into_inner) {
+            Some(closing) => closing.done.clone(),
+            None => return Ok(()),
+        };
+        let _ = done.wait_for(|finished| *finished).await;
+        let Some(closing) = self
+            .closing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        else {
+            return Ok(());
+        };
+        let outcome = closing
+            .outcome
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+            .unwrap_or_else(|| Err(Error::new(ErrorKind::Stream, "topic writer task failed")));
+        let cause = match outcome {
+            Ok(()) => {
+                self.reporter.status.close();
+                return Ok(());
+            }
+            Err(cause) => cause,
+        };
+        let (error, report) = self.upload_error(cause, closing.end_sent.load(Ordering::Relaxed));
+        self.set_state(
+            TopicWriterStatus::FinalizedWithError,
+            Some(error.to_string()),
+        );
+        if let Some(reason) = report {
+            self.reporter.report(&reason).await;
+        }
+        Err(error)
+    }
+
+    fn finalized(&self) -> Error {
+        let state = self.reporter.status.lock();
+        let message = match (&state.status, &state.last_error) {
+            (TopicWriterStatus::FinalizedWithError, Some(reason)) => {
+                format!("topic '{}' is finalized: {reason}", self.reporter.name)
+            }
+            _ => format!("topic '{}' is finalized", self.reporter.name),
+        };
+        Error::new(ErrorKind::Closed, message)
+    }
+
+    async fn open<'a>(&self, slot: &'a mut Option<Slot>) -> Result<&'a mut Slot> {
+        if slot.as_ref().is_some_and(|open| open.writer.failed()) {
+            return Err(self.fail(slot).await);
+        }
+        slot.as_mut().ok_or_else(|| self.finalized())
+    }
+
+    async fn settle(&self, slot: &mut Option<Slot>, result: Result<bool>) -> Result<bool> {
+        if result.is_err() && slot.as_ref().is_some_and(|open| open.writer.failed()) {
+            return Err(self.fail(slot).await);
+        }
+        self.record(result.as_ref().map(|sent| *sent));
+        result
+    }
+
+    async fn fail(&self, slot: &mut Option<Slot>) -> Error {
+        if let Some(open) = slot.take() {
+            self.start_closing(open.writer);
+        }
+        let error = match self.closed().await {
+            Ok(()) => return self.finalized(),
+            Err(error) => error,
+        };
+        self.set_state(
+            TopicWriterStatus::FinalizedWithError,
+            Some(error.to_string()),
+        );
+        error
+    }
+
     pub(super) fn set_state(&self, status: TopicWriterStatus, last_error: Option<String>) {
-        self.status.set(status, last_error);
+        self.reporter.status.set(status, last_error);
     }
 
     fn record(&self, result: std::result::Result<bool, &Error>) {
@@ -311,13 +533,15 @@ impl TopicState {
             return Ok(());
         };
         check_follows(
-            &self.name,
+            &self.reporter.name,
             self.last_timestamp.load(Ordering::Relaxed),
             first,
         )?;
-        slot.writer.enqueue(batch, None, false).await?;
-        self.last_timestamp.store(last, Ordering::Relaxed);
-        Ok(())
+        slot.writer
+            .enqueue(batch, None, false, || {
+                self.last_timestamp.store(last, Ordering::Relaxed)
+            })
+            .await
     }
 
     async fn push_record<T: Encode>(
@@ -330,14 +554,13 @@ impl TopicState {
             return Err(interrupted_error());
         }
         check_follows(
-            &self.name,
+            &self.reporter.name,
             self.last_timestamp.load(Ordering::Relaxed),
             timestamp_ns,
         )?;
         let size = value.size();
-        let limit = slot.writer.record_limit();
-        if size > limit {
-            self.drop_record(size, limit).await;
+        if size > slot.writer.record_limit() {
+            self.reporter.record_dropped(1, size, true).await;
             return Ok(false);
         }
         self.send_ready(slot).await?;
@@ -352,6 +575,16 @@ impl TopicState {
         let rows = match &mut slot.rows {
             Some(rows) => rows,
             None => {
+                if T::TAG != self.ontology_tag || T::FORMAT != self.format {
+                    return Err(Error::invalid_argument(format!(
+                        "topic '{}' stores {} ({:?}), not {} ({:?})",
+                        self.reporter.name,
+                        self.ontology_tag,
+                        self.format,
+                        T::TAG,
+                        T::FORMAT
+                    )));
+                }
                 let buffer = RowBuffer::<T>::new();
                 slot.writer.check_shape(buffer.schema())?;
                 slot.rows.insert(Box::new(buffer))
@@ -374,7 +607,7 @@ impl TopicState {
         Ok(true)
     }
 
-    async fn push_row(&self, slot: &mut Slot, row: RecordBatch, size: usize) -> Result<bool> {
+    async fn push_row(&self, slot: &mut Slot, row: RecordBatch) -> Result<bool> {
         if slot.writer.interrupted() {
             return Err(interrupted_error());
         }
@@ -388,13 +621,13 @@ impl TopicState {
             return Ok(false);
         };
         check_follows(
-            &self.name,
+            &self.reporter.name,
             self.last_timestamp.load(Ordering::Relaxed),
             timestamp_ns,
         )?;
-        let limit = slot.writer.record_limit();
-        if size > limit {
-            self.drop_record(size, limit).await;
+        let size = estimate(&row);
+        if size > slot.writer.record_limit() {
+            self.reporter.record_dropped(1, size, true).await;
             return Ok(false);
         }
         self.send_ready(slot).await?;
@@ -438,46 +671,39 @@ impl TopicState {
         if let Some(rows) = slot.rows.as_mut() {
             slot.ready = rows.take(urgent)?;
         }
-        self.send_ready(slot).await
+        self.send_ready(slot).await?;
+        slot.writer.drain().await
     }
 
     async fn send_ready(&self, slot: &mut Slot) -> Result<()> {
         let Some(chunk) = &slot.ready else {
             return Ok(());
         };
+        let (since, urgent) = (chunk.since, chunk.urgent);
         let batch = slot.writer.conform(chunk.batch.clone()).await?;
+        let ready = &mut slot.ready;
         slot.writer
-            .enqueue(batch, chunk.since, chunk.urgent)
-            .await?;
-        slot.ready = None;
-        Ok(())
-    }
-
-    async fn drop_record(&self, size: usize, limit: usize) {
-        let message = format!(
-            "record dropped for topic '{}': its size ({size} bytes) exceeds the message size limit ({limit} bytes) and it cannot be split further",
-            self.name
-        );
-        self.status.record_dropped(1, message.clone());
-        let _ = self
-            .connection
-            .notify_error(ActionKind::TopicNotificationCreate, &self.locator, message)
-            .await;
+            .enqueue(batch, since, urgent, || *ready = None)
+            .await
     }
 
     pub(super) async fn close(&self, close: Close<'_>) -> Result<()> {
         let mut guard = self.slot.lock().await;
-        let Some(mut slot) = guard.take() else {
-            return Ok(());
+        self.close_slot(&mut guard, close).await
+    }
+
+    async fn close_slot(&self, slot: &mut Option<Slot>, close: Close<'_>) -> Result<()> {
+        let Some(open) = slot.as_mut() else {
+            return self.closed().await;
         };
-        let reason = match close {
-            Close::Finish => None,
+        let (sent, reason) = match close {
+            Close::Finish => (self.send_rows(open, false).await, None),
             Close::Report(reason) => {
-                self.report(reason).await;
-                Some(reason)
+                self.reporter.report(reason).await;
+                (Ok(()), Some(reason))
             }
             Close::Discard(reason) => {
-                drop(slot);
+                *slot = None;
                 self.set_state(
                     TopicWriterStatus::FinalizedWithError,
                     Some(reason.to_owned()),
@@ -485,32 +711,37 @@ impl TopicState {
                 return Ok(());
             }
         };
-        let sent = match reason {
-            None => self.send_rows(&mut slot, false).await,
-            Some(_) => Ok(()),
+        let Some(open) = slot.take() else {
+            return sent;
         };
-        let result = sent.and(slot.writer.finish().await);
-        match (&result, reason) {
-            (Ok(()), None) => self.set_state(TopicWriterStatus::Finalized, None),
-            (Err(error), _) => self.set_state(
-                TopicWriterStatus::FinalizedWithError,
-                Some(error.to_string()),
-            ),
-            (Ok(()), Some(reason)) => self.set_state(
+        match reason {
+            None => self.set_state(TopicWriterStatus::Finalized, None),
+            Some(reason) => self.set_state(
                 TopicWriterStatus::FinalizedWithError,
                 Some(reason.to_owned()),
             ),
         }
+        self.start_closing(open.writer);
+        let result = match self.closed().await {
+            Ok(()) => sent,
+            Err(error) if error.kind() == ErrorKind::Closed => sent.and(Err(error)),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = &result {
+            self.set_state(
+                TopicWriterStatus::FinalizedWithError,
+                Some(error.to_string()),
+            );
+        }
         result
     }
+}
 
-    async fn report(&self, reason: &str) {
-        let message = format!("topic '{}' failed: {reason}", self.locator);
-        let _ = self
-            .connection
-            .notify_error(ActionKind::TopicNotificationCreate, &self.locator, message)
-            .await;
-    }
+fn terminal(status: TopicWriterStatus) -> bool {
+    matches!(
+        status,
+        TopicWriterStatus::Finalized | TopicWriterStatus::FinalizedWithError
+    )
 }
 
 fn timestamp_range(batch: &RecordBatch) -> Result<Option<(i64, i64)>> {
@@ -553,8 +784,307 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{ArrayRef, Int64Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Fields, Schema};
 
     use super::*;
+    use crate::ontology::{Ontology, RecordBuilder};
+    use crate::write::session::Interrupter;
+
+    fn offline_writer(on_error: TopicErrorPolicy) -> TopicWriter {
+        let connection = Connection::offline(1 << 20);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            TIMESTAMP,
+            DataType::Int64,
+            false,
+        )]));
+        let reporter = Arc::new(Reporter::new(
+            "/t".to_owned(),
+            "run/t".to_owned(),
+            connection.clone(),
+        ));
+        let writer = BatchWriter::open(
+            &connection,
+            reporter.clone(),
+            String::new(),
+            schema,
+            connection.scope().token(),
+            Interrupter::default(),
+        );
+        let topic = TopicState::new(
+            "Empty".to_owned(),
+            Format::Default,
+            on_error,
+            reporter,
+            writer,
+        );
+        TopicWriter::new(Arc::new(topic))
+    }
+
+    #[tokio::test]
+    async fn error_after_finalize() {
+        for policy in [
+            TopicErrorPolicy::Raise,
+            TopicErrorPolicy::Ignore,
+            TopicErrorPolicy::Finalize,
+        ] {
+            let writer = offline_writer(policy);
+            writer.topic.close(Close::Discard("closed")).await.unwrap();
+            let suppressed = writer.handle_error("late push").await.unwrap();
+            assert_eq!(suppressed, policy == TopicErrorPolicy::Ignore);
+            assert_eq!(writer.status(), TopicWriterStatus::FinalizedWithError);
+            assert_eq!(writer.last_error().as_deref(), Some("closed"));
+        }
+    }
+
+    #[tokio::test]
+    async fn finalize_policy_failed_close() {
+        let writer = offline_writer(TopicErrorPolicy::Finalize);
+        let error = writer.handle_error("sensor lost").await.unwrap_err();
+        assert_eq!(writer.status(), TopicWriterStatus::FinalizedWithError);
+        assert_eq!(writer.last_error(), Some(error.to_string()));
+        assert!(!writer.handle_error("again").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn finalize_once() {
+        for reason in [None, Some("camera unplugged")] {
+            let writer = offline_writer(TopicErrorPolicy::Raise);
+            let error = writer.finalize(reason).await.unwrap_err();
+            assert_eq!(writer.status(), TopicWriterStatus::FinalizedWithError);
+            assert_eq!(writer.last_error(), Some(error.to_string()));
+            writer.finalize(None).await.unwrap();
+            assert_eq!(writer.status(), TopicWriterStatus::FinalizedWithError);
+            assert_eq!(writer.last_error(), Some(error.to_string()));
+            let pushed = writer.push_batch(batch(vec![Some(1)])).await;
+            assert_eq!(kind(pushed), ErrorKind::Closed);
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_read_error_sets_raised() {
+        let writer = offline_writer(TopicErrorPolicy::Raise);
+        let failing = futures::stream::iter([Err::<RecordBatch, _>(std::io::Error::other(
+            "camera unplugged",
+        ))]);
+        let error = writer.push_stream(failing).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidArgument);
+        assert_eq!(writer.status(), TopicWriterStatus::Raised);
+        assert_eq!(
+            writer.last_error().as_deref(),
+            Some("cannot read batch: camera unplugged")
+        );
+    }
+
+    async fn wait_for_the_upload_to_fail(writer: &TopicWriter) {
+        for _ in 0..500 {
+            let guard = writer.topic.slot.lock().await;
+            if guard.as_ref().is_some_and(|slot| slot.writer.failed()) {
+                return;
+            }
+            drop(guard);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the upload did not fail");
+    }
+
+    #[tokio::test]
+    async fn dead_upload_finalizes_topic() {
+        for policy in [
+            TopicErrorPolicy::Raise,
+            TopicErrorPolicy::Ignore,
+            TopicErrorPolicy::Finalize,
+        ] {
+            let writer = offline_writer(policy);
+            wait_for_the_upload_to_fail(&writer).await;
+            let row = batch(vec![Some(1)]);
+            let error = writer.push_row(row.clone()).await.unwrap_err();
+            assert_ne!(error.kind(), ErrorKind::Closed);
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("the upload of topic '/t' failed: ")
+            );
+            assert_eq!(writer.status(), TopicWriterStatus::FinalizedWithError);
+            assert_eq!(writer.last_error(), Some(error.to_string()));
+            let recorded = writer.topic.upload_failure().unwrap();
+            assert_eq!(recorded.to_string(), error.to_string());
+            assert_eq!(recorded.kind(), error.kind());
+            let again = writer.push_row(row).await.unwrap_err();
+            assert_eq!(again.kind(), ErrorKind::Closed);
+            assert_eq!(
+                again.to_string(),
+                format!("topic '/t' is finalized: {error}")
+            );
+            assert_eq!(
+                writer.handle_error(&again.to_string()).await.unwrap(),
+                policy == TopicErrorPolicy::Ignore
+            );
+            assert_eq!(writer.status(), TopicWriterStatus::FinalizedWithError);
+            assert_eq!(writer.last_error(), Some(error.to_string()));
+            assert_eq!(kind(writer.flush().await), ErrorKind::Closed);
+            writer.finalize(None).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_failure_at_close() {
+        let writer = offline_writer(TopicErrorPolicy::Raise);
+        wait_for_the_upload_to_fail(&writer).await;
+        let error = writer.finalize(None).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("the upload of topic '/t' failed: ")
+        );
+        assert_eq!(writer.last_error(), Some(error.to_string()));
+        assert_eq!(
+            writer.topic.upload_failure().map(|e| e.to_string()),
+            Some(error.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_close_status() {
+        use futures::FutureExt;
+
+        let cancelled = offline_writer(TopicErrorPolicy::Raise);
+        assert!(cancelled.finalize(None).now_or_never().is_none());
+        let failed = offline_writer(TopicErrorPolicy::Ignore);
+        wait_for_the_upload_to_fail(&failed).await;
+        let row = batch(vec![Some(1)]);
+        assert!(failed.push_row(row.clone()).now_or_never().is_none());
+        for writer in [cancelled, failed] {
+            assert!(writer.topic.slot.lock().await.is_none());
+            let error = writer.finalize(None).await.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("the upload of topic '/t' failed: ")
+            );
+            assert_eq!(writer.status(), TopicWriterStatus::FinalizedWithError);
+            assert_eq!(writer.last_error(), Some(error.to_string()));
+            let pushed = writer.push_row(row.clone()).await.unwrap_err();
+            assert_eq!(
+                pushed.to_string(),
+                format!("topic '/t' is finalized: {error}")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_upload_not_failed() {
+        let writer = offline_writer(TopicErrorPolicy::Raise);
+        let (closed, report) = writer.topic.upload_error(interrupted_error(), false);
+        assert_eq!(closed.kind(), ErrorKind::Closed);
+        assert!(report.is_none());
+        assert!(writer.topic.upload_failure().is_none());
+        let (failed, report) = writer
+            .topic
+            .upload_error(Error::new(ErrorKind::Connection, "broken pipe"), true);
+        assert!(report.is_none());
+        assert_eq!(
+            failed.to_string(),
+            "the upload of topic '/t' failed: broken pipe"
+        );
+        assert!(writer.topic.upload_failure().is_some());
+    }
+
+    #[test]
+    fn final_status_is_sticky() {
+        let status = Status::new();
+        status.set(
+            TopicWriterStatus::FinalizedWithError,
+            Some("dead".to_owned()),
+        );
+        status.set(TopicWriterStatus::Raised, Some("late".to_owned()));
+        status.set(TopicWriterStatus::Active, None);
+        assert_eq!(status.lock().status, TopicWriterStatus::FinalizedWithError);
+        assert_eq!(status.lock().last_error.as_deref(), Some("dead"));
+        status.set(TopicWriterStatus::Finalized, None);
+        assert_eq!(status.lock().status, TopicWriterStatus::Finalized);
+    }
+
+    #[test]
+    fn flush_policy_builder() {
+        let policy = FlushPolicy::default()
+            .max_bytes(10)
+            .max_rows(2)
+            .max_age(Duration::from_millis(5));
+        assert_eq!(
+            (policy.max_bytes, policy.max_rows, policy.max_age),
+            (Some(10), Some(2), Some(Duration::from_millis(5)))
+        );
+    }
+
+    #[test]
+    fn late_drop_keeps_newer_error() {
+        for (before, at_push, after) in [
+            (
+                TopicWriterStatus::Active,
+                false,
+                TopicWriterStatus::RecordTooLarge,
+            ),
+            (
+                TopicWriterStatus::RecordTooLarge,
+                false,
+                TopicWriterStatus::RecordTooLarge,
+            ),
+            (TopicWriterStatus::Raised, false, TopicWriterStatus::Raised),
+            (
+                TopicWriterStatus::IgnoredLastError,
+                false,
+                TopicWriterStatus::IgnoredLastError,
+            ),
+            (
+                TopicWriterStatus::Raised,
+                true,
+                TopicWriterStatus::RecordTooLarge,
+            ),
+            (
+                TopicWriterStatus::IgnoredLastError,
+                true,
+                TopicWriterStatus::RecordTooLarge,
+            ),
+            (
+                TopicWriterStatus::Finalized,
+                true,
+                TopicWriterStatus::Finalized,
+            ),
+            (
+                TopicWriterStatus::FinalizedWithError,
+                false,
+                TopicWriterStatus::FinalizedWithError,
+            ),
+        ] {
+            let status = Status::new();
+            status.set(before, Some("before".to_owned()));
+            status.record_dropped(2, "dropped".to_owned(), at_push);
+            assert_eq!(status.lock().status, after, "{before:?} at push {at_push}");
+            let last = match after {
+                TopicWriterStatus::RecordTooLarge => "dropped",
+                _ => "before",
+            };
+            assert_eq!(status.lock().last_error.as_deref(), Some(last));
+            assert_eq!(status.dropped(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn dropped_record_message() {
+        let reporter = Reporter::new(
+            "/t".to_owned(),
+            "run/t".to_owned(),
+            Connection::offline(1 << 20),
+        );
+        reporter.record_dropped(3, 2_000_000, false).await;
+        assert_eq!(
+            reporter.status.lock().last_error,
+            Some(format!(
+                "3 record(s) dropped for topic '/t': each is larger alone than the message size limit ({} bytes), the largest is 2000000 bytes",
+                reporter.limit
+            ))
+        );
+    }
 
     fn batch(timestamps: Vec<Option<i64>>) -> RecordBatch {
         let column: ArrayRef = Arc::new(Int64Array::from(timestamps));
@@ -566,14 +1096,14 @@ mod tests {
     }
 
     #[test]
-    fn equal_timestamps_are_accepted_within_a_batch() {
+    fn equal_timestamps_accepted() {
         let range = timestamp_range(&batch(vec![Some(1), Some(1), Some(2), Some(2)]));
         assert_eq!(range.unwrap(), Some((1, 2)));
         assert_eq!(timestamp_range(&batch(vec![])).unwrap(), None);
     }
 
     #[test]
-    fn decreasing_or_null_timestamps_are_rejected() {
+    fn rejects_bad_timestamps() {
         let decreasing = timestamp_range(&batch(vec![Some(2), Some(1)]));
         assert_eq!(kind(decreasing), ErrorKind::InvalidArgument);
         let nulls = timestamp_range(&batch(vec![Some(1), None]));
@@ -581,7 +1111,7 @@ mod tests {
     }
 
     #[test]
-    fn a_push_may_not_start_before_the_last_pushed_timestamp() {
+    fn push_after_last_timestamp() {
         assert!(check_follows("/t", i64::MIN, i64::MIN).is_ok());
         assert!(check_follows("/t", 5, 5).is_ok());
         assert!(check_follows("/t", 5, 6).is_ok());
@@ -592,5 +1122,73 @@ mod tests {
                 .to_string()
                 .contains("got 4, lower than the last pushed timestamp 5")
         );
+    }
+
+    #[derive(Default)]
+    struct NoColumns;
+
+    impl<T> RecordBuilder<T> for NoColumns {
+        fn append(&mut self, _: &T) {}
+
+        fn finish(&mut self) -> Vec<ArrayRef> {
+            Vec::new()
+        }
+    }
+
+    macro_rules! empty_record {
+        ($name:ident, $tag:literal, $format:expr) => {
+            struct $name;
+
+            impl Ontology for $name {
+                const TAG: &'static str = $tag;
+                type Columns = ();
+                type View<'a> = ();
+
+                fn columns(_: &RecordBatch) -> Result<()> {
+                    Ok(())
+                }
+
+                fn view(_: &(), _: usize) {}
+
+                fn from_view(_: &()) -> Result<Self> {
+                    Ok(Self)
+                }
+            }
+
+            impl Encode for $name {
+                const FORMAT: Format = $format;
+                type Builder = NoColumns;
+
+                fn fields() -> Fields {
+                    Fields::empty()
+                }
+
+                fn size(&self) -> usize {
+                    8
+                }
+            }
+        };
+    }
+
+    empty_record!(Empty, "Empty", Format::Default);
+    empty_record!(Other, "Other", Format::Default);
+    empty_record!(RaggedEmpty, "Empty", Format::Ragged);
+
+    #[tokio::test]
+    async fn push_checks_tag_and_format() {
+        let writer = offline_writer(TopicErrorPolicy::Raise);
+        let error = writer.push(1, &Other).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidArgument);
+        assert_eq!(
+            error.to_string(),
+            "topic '/t' stores Empty (Default), not Other (Default)"
+        );
+        let error = writer.push(1, &RaggedEmpty).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "topic '/t' stores Empty (Default), not Empty (Ragged)"
+        );
+        writer.push(1, &Empty).await.unwrap();
+        writer.push(2, &Empty).await.unwrap();
     }
 }

@@ -5,6 +5,7 @@ use crate::comm::proto;
 use crate::error::Result;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Format {
     #[default]
     Default,
@@ -48,6 +49,7 @@ pub trait RecordBuilder<T>: Default + Send + 'static {
     fn finish(&mut self) -> Vec<ArrayRef>;
 }
 
+#[non_exhaustive]
 pub struct Message<'a, T: Ontology + 'a> {
     pub timestamp_ns: i64,
     pub view: T::View<'a>,

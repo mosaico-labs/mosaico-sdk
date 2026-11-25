@@ -119,7 +119,7 @@ mod tests {
     }
 
     #[test]
-    fn an_urgent_item_sends_what_is_held() {
+    fn urgent_item_flushes() {
         let mut pending = pending(FlushPolicy::default());
         assert!(pending.add(queued(1, 10)).is_empty());
         let urgent = Queued {
@@ -159,7 +159,7 @@ mod tests {
     }
 
     #[test]
-    fn sends_at_once_when_a_batch_fills_the_target() {
+    fn full_batch_sent_at_once() {
         let mut pending = pending(FlushPolicy::default());
         assert!(pending.add(queued(1, 30)).is_empty());
         assert_eq!(sizes(&pending.add(queued(1, 100))), vec![1, 1]);
@@ -167,7 +167,7 @@ mod tests {
     }
 
     #[test]
-    fn max_bytes_cannot_exceed_the_target() {
+    fn max_bytes_capped_by_target() {
         let mut pending = pending(FlushPolicy {
             max_bytes: Some(1000),
             ..FlushPolicy::default()
@@ -208,7 +208,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stricter_policy_sends_what_is_held() {
+    fn stricter_policy_flushes() {
         let mut pending = pending(FlushPolicy::default());
         assert!(pending.add(queued(4, 10)).is_empty());
         let ready = pending.set_policy(FlushPolicy {

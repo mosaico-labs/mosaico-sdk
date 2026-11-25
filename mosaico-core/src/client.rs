@@ -12,6 +12,7 @@ use crate::write::sequence::SequenceWriter;
 use crate::write::session::SessionErrorPolicy;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Notification {
     pub sequence: String,
     pub topic: Option<String>,

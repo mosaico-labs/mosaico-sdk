@@ -63,7 +63,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn topic_names_are_normalized_like_paths() {
+    fn topic_name_normalization() {
         assert_eq!(topic_name("imu"), "/imu");
         assert_eq!(topic_name("/sensors//imu/"), "/sensors/imu");
         assert_eq!(topic_name("./sensors/./imu"), "/sensors/imu");
@@ -71,7 +71,7 @@ mod tests {
     }
 
     #[test]
-    fn new_topic_names_follow_the_sdk_rules() {
+    fn topic_name_rules() {
         assert_eq!(
             new_topic_name("/sensors//imu_1-a/").unwrap(),
             "/sensors/imu_1-a"
@@ -85,7 +85,7 @@ mod tests {
     }
 
     #[test]
-    fn new_sequence_names_follow_the_sdk_rules() {
+    fn sequence_name_rules() {
         assert_eq!(new_sequence_name("/run_01-a/").unwrap(), "run_01-a");
         for bad in ["", "/", "a/b", "_run", "run 1", "run.1", "rün"] {
             let error = new_sequence_name(bad).unwrap_err();

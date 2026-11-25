@@ -27,6 +27,7 @@ pub struct Error {
     kind: ErrorKind,
     message: String,
     source: Option<Box<dyn StdError + Send + Sync>>,
+    left_open: bool,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -37,11 +38,29 @@ impl Error {
             kind,
             message: message.into(),
             source: None,
+            left_open: false,
         }
     }
 
     pub(crate) fn with_source(mut self, source: impl StdError + Send + Sync + 'static) -> Self {
         self.source = Some(Box::new(source));
+        self
+    }
+
+    pub(crate) fn session_left_open(mut self) -> Self {
+        self.left_open = true;
+        self
+    }
+
+    pub(crate) fn left_open_by(mut self, abort: &Error) -> Self {
+        let text = self.to_string();
+        let abort = abort.to_string();
+        self.message = if abort == text {
+            format!("{text}; the session stays open on the server")
+        } else {
+            format!("{text}; the session stays open on the server: {abort}")
+        };
+        self.left_open = true;
         self
     }
 
@@ -67,6 +86,10 @@ impl Error {
 
     pub fn kind(&self) -> ErrorKind {
         self.kind
+    }
+
+    pub fn left_open(&self) -> bool {
+        self.left_open
     }
 }
 

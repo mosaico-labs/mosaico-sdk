@@ -1,16 +1,16 @@
 use std::sync::Arc;
 
-use arrow_schema::{DataType, SchemaRef};
+use arrow_schema::SchemaRef;
 
 use crate::comm::connection::Connection;
 use crate::error::{Error, ErrorKind, Result};
 use crate::locator::{new_topic_name, topic_name};
 use crate::ontology::{Encode, Format};
+use crate::write::batch_writer::BatchWriter;
 use crate::write::rows::record_schema;
+use crate::write::schema_rules::check_schema;
 use crate::write::session::{Interrupter, Session, SessionErrorPolicy, interrupted_error};
-use crate::write::topic::{
-    Close, TIMESTAMP, TopicErrorPolicy, TopicState, TopicWriter, TopicWriterStatus,
-};
+use crate::write::topic::{Close, Reporter, TopicErrorPolicy, TopicState, TopicWriter};
 
 const INTERRUPTED: &str = "interrupted";
 
@@ -73,24 +73,28 @@ impl SequenceWriter {
                 format!("topic '{name}' already created in this session"),
             ));
         }
-        match schema
-            .field_with_name(TIMESTAMP)
-            .map(|field| field.data_type())
-        {
-            Ok(DataType::Int64) => {}
-            _ => {
-                return Err(Error::schema(format!(
-                    "schema must have a '{TIMESTAMP}' column of type Int64"
-                )));
-            }
-        }
-        let writer = self
+        check_schema(&schema)?;
+        let created = self
             .session
-            .create_topic(&name, ontology_tag, format, schema, metadata)
+            .create_topic(&name, ontology_tag, format, metadata)
             .await?;
-        let locator = format!("{}{name}", self.session.sequence());
-        let connection = self.session.connection().clone();
-        let topic = Arc::new(TopicState::new(name, locator, connection, on_error, writer));
+        let connection = self.session.connection();
+        let reporter = Arc::new(Reporter::new(name, created.locator, connection.clone()));
+        let writer = BatchWriter::open(
+            connection,
+            reporter.clone(),
+            created.uuid,
+            schema,
+            self.session.token(),
+            self.session.interrupter().clone(),
+        );
+        let topic = Arc::new(TopicState::new(
+            ontology_tag.to_owned(),
+            format,
+            on_error,
+            reporter,
+            writer,
+        ));
         self.topics.push(topic.clone());
         Ok(TopicWriter::new(topic))
     }
@@ -127,15 +131,32 @@ impl SequenceWriter {
         if self.session.interrupter().interrupted() {
             return self.close_interrupted().await;
         }
-        let error = match closed.into_iter().find_map(Result::err) {
+        let failed = closed
+            .into_iter()
+            .find_map(Result::err)
+            .or_else(|| self.upload_failure());
+        let error = match failed {
             Some(error) => error,
-            None => match self.session.finish().await {
+            None => match self.session.finalize(&self.topics).await {
                 Ok(()) => return Ok(()),
                 Err(error) => error,
             },
         };
-        let _ = self.session.abort(&error.to_string()).await;
-        Err(error)
+        match self.session.abort(&error.to_string(), &self.topics).await {
+            Err(abort) if abort.left_open() => Err(error.left_open_by(&abort)),
+            _ => Err(error),
+        }
+    }
+
+    pub async fn complete<T>(self, result: Result<T>) -> Result<T> {
+        let error = match result {
+            Ok(value) => return self.finish().await.map(|()| value),
+            Err(error) => error,
+        };
+        match self.abort(&error.to_string()).await {
+            Err(abort) if abort.left_open() => Err(error.left_open_by(&abort)),
+            _ => Err(error),
+        }
     }
 
     pub async fn abort(self, reason: &str) -> Result<()> {
@@ -145,17 +166,69 @@ impl SequenceWriter {
             Close::Report(reason)
         };
         futures::future::join_all(self.topics.iter().map(|topic| topic.close(close))).await;
-        self.session.abort(reason).await
+        self.session.abort(reason, &self.topics).await
+    }
+
+    fn upload_failure(&self) -> Option<Error> {
+        self.topics.iter().find_map(|topic| topic.upload_failure())
     }
 
     async fn close_interrupted(self) -> Result<()> {
-        for topic in &self.topics {
-            topic.set_state(
-                TopicWriterStatus::FinalizedWithError,
-                Some(INTERRUPTED.to_owned()),
+        match self.session.abort(INTERRUPTED, &self.topics).await {
+            Err(abort) if abort.left_open() => Err(interrupted_error().left_open_by(&abort)),
+            _ => Err(interrupted_error()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn offline(policy: SessionErrorPolicy) -> SequenceWriter {
+        SequenceWriter {
+            session: Session::offline(policy),
+            topics: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_err_returns_error() {
+        for policy in [SessionErrorPolicy::Report, SessionErrorPolicy::Delete] {
+            let failed: Result<()> = Err(Error::invalid_argument("camera unplugged"));
+            let error = offline(policy).complete(failed).await.unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::InvalidArgument);
+            assert!(error.left_open());
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("camera unplugged; the session stays open on the server")
             );
         }
-        self.session.abort(INTERRUPTED).await?;
-        Err(interrupted_error())
+    }
+
+    #[tokio::test]
+    async fn interrupted_finish() {
+        for policy in [SessionErrorPolicy::Report, SessionErrorPolicy::Delete] {
+            let writer = offline(policy);
+            writer.session.interrupter().interrupt();
+            let error = writer.finish().await.unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Closed);
+            assert!(error.left_open());
+            assert!(error.to_string().starts_with(&format!(
+                "{}; the session stays open on the server",
+                interrupted_error()
+            )));
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_ok_finishes() {
+        let error = offline(SessionErrorPolicy::Report)
+            .complete(Ok(7))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Connection);
+        assert!(error.left_open());
     }
 }

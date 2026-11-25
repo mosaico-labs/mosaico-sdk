@@ -204,7 +204,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn metadata_differences_are_relabelled_without_copies() {
+    fn relabel_without_copy() {
         let plain = Field::new("x", DataType::Float64, true);
         let described = plain.clone().with_metadata(
             [("description".to_owned(), "x".to_owned())]
@@ -242,7 +242,7 @@ mod tests {
     }
 
     #[test]
-    fn a_null_in_a_required_struct_child_is_found() {
+    fn null_in_required_child() {
         let (array, field) = pose(vec![Some(1.0), None], None);
         assert_eq!(
             unmasked_nulls(&array, &field, None),
@@ -251,7 +251,7 @@ mod tests {
     }
 
     #[test]
-    fn a_null_under_a_null_parent_is_allowed() {
+    fn null_under_null_parent() {
         let (array, field) = pose(vec![Some(1.0), None], Some(vec![true, false]));
         assert_eq!(unmasked_nulls(&array, &field, None), None);
     }
@@ -271,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn a_null_item_in_a_valid_list_is_found() {
+    fn null_item_in_list() {
         let (array, field) = items(None);
         assert_eq!(
             unmasked_nulls(array.as_ref(), &field, None),
@@ -284,13 +284,13 @@ mod tests {
     }
 
     #[test]
-    fn a_null_item_in_a_null_list_is_allowed() {
+    fn null_item_in_null_list() {
         let (array, field) = items(Some(vec![true, false]));
         assert_eq!(unmasked_nulls(array.as_ref(), &field, None), None);
     }
 
     #[test]
-    fn a_required_top_level_column_with_nulls_is_found() {
+    fn nulls_in_required_column() {
         let array = Int64Array::from(vec![Some(1), None]);
         let field = Field::new("v", DataType::Int64, false);
         assert_eq!(unmasked_nulls(&array, &field, None), Some("v".to_owned()));

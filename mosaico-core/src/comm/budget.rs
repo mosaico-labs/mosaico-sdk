@@ -6,10 +6,14 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError, watch};
 
 use crate::comm::connection::ServerInfo;
 
-use super::{QUEUE_MESSAGES, limits};
-
 const BUDGET_BYTES: usize = 512 << 20;
 const PRESSURE_RETRY: Duration = Duration::from_millis(10);
+pub(crate) const QUEUE_MESSAGES: usize = 4;
+
+pub(crate) fn limits(info: &ServerInfo) -> (usize, usize) {
+    let limit = usize::try_from(info.max_batch_size_bytes()).unwrap_or(usize::MAX);
+    (limit, limit.clamp(1, u32::MAX as usize / QUEUE_MESSAGES))
+}
 
 pub(crate) struct WriteBudget {
     semaphore: Arc<Semaphore>,
@@ -22,18 +26,18 @@ impl WriteBudget {
         Self::new(BUDGET_BYTES.max(QUEUE_MESSAGES * target))
     }
 
-    pub(super) fn new(bytes: usize) -> Self {
+    pub(crate) fn new(bytes: usize) -> Self {
         Self {
             semaphore: Arc::new(Semaphore::new(bytes.clamp(1, Semaphore::MAX_PERMITS))),
             pressure: watch::Sender::new(0),
         }
     }
 
-    pub(super) fn pressure(&self) -> watch::Receiver<u64> {
+    pub(crate) fn pressure(&self) -> watch::Receiver<u64> {
         self.pressure.subscribe()
     }
 
-    pub(super) async fn acquire(
+    pub(crate) async fn acquire(
         &self,
         permits: u32,
         topic: &Semaphore,
@@ -62,7 +66,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn a_full_budget_asks_the_topics_to_send() {
+    async fn full_budget_signals_pressure() {
         let budget = Arc::new(WriteBudget::new(100));
         let mut pressure = budget.pressure();
         let topic = Semaphore::new(1000);
@@ -81,7 +85,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_closed_topic_stops_waiting_for_the_budget() {
+    async fn closed_topic_stops_waiting() {
         let budget = WriteBudget::new(10);
         let topic = Semaphore::new(10);
         let _held = budget.acquire(10, &topic).await.unwrap();

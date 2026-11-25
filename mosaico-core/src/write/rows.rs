@@ -200,7 +200,7 @@ mod tests {
     }
 
     #[test]
-    fn rows_join_into_one_chunk_in_order() {
+    fn rows_join_in_order() {
         let first = row(1);
         let mut rows = BatchRows::new(first.schema());
         rows.append(first, 10);
@@ -219,7 +219,7 @@ mod tests {
     }
 
     #[test]
-    fn rows_follow_the_same_policy_as_typed_records() {
+    fn rows_follow_flush_policy() {
         let first = row(1);
         let mut rows = BatchRows::new(first.schema());
         rows.append(first, 10);
@@ -243,7 +243,7 @@ mod tests {
     }
 
     #[test]
-    fn rows_with_another_schema_are_not_joined() {
+    fn other_schema_not_joined() {
         let first = row(1);
         let rows = BatchRows::new(first.schema());
         assert!(rows.accepts(&row(2).schema()));

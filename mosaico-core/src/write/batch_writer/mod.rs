@@ -1,41 +1,36 @@
-mod budget;
 mod encoder;
 mod pending;
 mod schema;
 
+use std::collections::VecDeque;
 use std::pin::pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 use arrow_array::{Array, RecordBatch, make_array};
 use arrow_flight::{FlightData, FlightDescriptor, SchemaAsIpc};
-use arrow_ipc::writer::IpcWriteOptions;
 use arrow_schema::{DataType, Schema, SchemaRef};
 use futures::future::Either;
 use prost::Message;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
-use crate::comm::action::ActionKind;
-use crate::comm::connection::{Connection, ServerInfo};
+use crate::comm::budget::{QUEUE_MESSAGES, WriteBudget, limits};
+use crate::comm::connection::Connection;
 use crate::comm::proto;
 use crate::error::{Error, ErrorKind, Result};
 use crate::scope::Token;
 use crate::write::session::{Interrupter, interrupted_error};
-use crate::write::topic::{FlushPolicy, Status};
+use crate::write::topic::{FlushPolicy, Reporter};
 
-pub(crate) use self::budget::WriteBudget;
-use self::encoder::{Encoder, ipc_compression, split};
+pub(crate) use self::encoder::estimate;
+use self::encoder::{Encoder, split};
 use self::pending::Pending;
 pub(crate) use self::schema::Conversion;
 use self::schema::{plain_schema, relabel, shape, shape_of, unmasked_nulls};
 
-const QUEUE_MESSAGES: usize = 2;
-
-fn limits(info: &ServerInfo) -> (usize, usize) {
-    let limit = usize::try_from(info.max_batch_size_bytes()).unwrap_or(usize::MAX);
-    (limit, limit.clamp(1, u32::MAX as usize / QUEUE_MESSAGES))
-}
+const IN_FLIGHT: usize = 2;
 
 enum Input {
     Batch(Queued),
@@ -57,8 +52,27 @@ struct Permits {
     _budget: OwnedSemaphorePermit,
 }
 
+struct Piece {
+    batch: RecordBatch,
+    bytes: usize,
+    since: Option<Instant>,
+    urgent: bool,
+}
+
+impl Piece {
+    fn queued(self, permit: Permits) -> Queued {
+        Queued {
+            batch: self.batch,
+            bytes: self.bytes,
+            since: self.since,
+            urgent: self.urgent,
+            permit,
+        }
+    }
+}
+
 enum Frame {
-    Data(FlightData),
+    Data(FlightData, Vec<Permits>),
     End,
 }
 
@@ -72,8 +86,9 @@ pub(crate) struct BatchWriter {
     target_bytes: usize,
     record_limit: usize,
     queue: Queue,
+    unsent: VecDeque<Piece>,
     failure: Failure,
-    status: Arc<Status>,
+    ended: Arc<AtomicBool>,
     interrupter: Interrupter,
     task: Option<JoinHandle<()>>,
 }
@@ -81,22 +96,18 @@ pub(crate) struct BatchWriter {
 impl BatchWriter {
     pub(crate) fn open(
         connection: &Connection,
-        locator: String,
+        reporter: Arc<Reporter>,
         topic_uuid: String,
         schema: SchemaRef,
         token: Arc<Token>,
         interrupter: Interrupter,
-    ) -> Result<Self> {
+    ) -> Self {
         let (limit, target_bytes) = limits(connection.info());
-        let options = IpcWriteOptions::default()
-            .try_with_compression(ipc_compression(connection.compression()))
-            .map_err(|e| {
-                Error::new(ErrorKind::InvalidArgument, "invalid IPC compression").with_source(e)
-            })?;
+        let options = connection.write_options().clone();
         let schema = plain_schema(&schema);
         let descriptor = FlightDescriptor::new_cmd(
             proto::flight::DoPutCmd {
-                locator: locator.clone(),
+                locator: reporter.locator().to_owned(),
                 topic_uuid,
             }
             .encode_to_vec(),
@@ -109,7 +120,6 @@ impl BatchWriter {
         let queue = Queue::new(target_bytes, budget);
         let (frames, outgoing) = mpsc::channel(1);
         let failure = Failure::default();
-        let status = Arc::new(Status::new());
         let encoding = Encoding {
             encoder: Arc::new(Encoder {
                 schema: schema.clone(),
@@ -117,11 +127,7 @@ impl BatchWriter {
                 limit,
             }),
             frames,
-            notifier: Notifier {
-                connection: connection.clone(),
-                locator,
-                status: status.clone(),
-            },
+            reporter,
             interrupter: interrupter.clone(),
         };
         let pending = Pending {
@@ -133,7 +139,16 @@ impl BatchWriter {
             since: None,
         };
         let encode = encode_loop(receiver, header, pending, encoding, Some(pressure));
-        let upload = upload(connection.dedicated(), outgoing);
+        let ended = Arc::new(AtomicBool::new(false));
+        let upload = upload(
+            connection.clone(),
+            Outgoing {
+                frames: outgoing,
+                pressure: Some(connection.write_budget().pressure()),
+                held: VecDeque::new(),
+                ended: ended.clone(),
+            },
+        );
         let slot = failure.clone();
         let closing = queue.semaphore.clone();
         let task = tokio::spawn(async move {
@@ -143,7 +158,10 @@ impl BatchWriter {
             {
                 Some(Ok(_)) => None,
                 Some(Err(error)) => Some(error),
-                None => Some(Error::new(ErrorKind::Closed, "client closed")),
+                None => Some(Error::new(
+                    ErrorKind::Closed,
+                    "the write session was closed",
+                )),
             };
             if let Some(error) = error {
                 lock(&slot).get_or_insert(error);
@@ -155,7 +173,7 @@ impl BatchWriter {
             .iter()
             .map(|field| shape(field.data_type()))
             .collect();
-        Ok(Self {
+        Self {
             input: Some(input),
             schema,
             shapes,
@@ -163,11 +181,12 @@ impl BatchWriter {
             target_bytes,
             record_limit: limit,
             queue,
+            unsent: VecDeque::new(),
             failure,
-            status,
+            ended,
             interrupter,
             task: Some(task),
-        })
+        }
     }
 
     pub(crate) fn target_bytes(&self) -> usize {
@@ -178,12 +197,16 @@ impl BatchWriter {
         self.record_limit
     }
 
-    pub(crate) fn status(&self) -> Arc<Status> {
-        self.status.clone()
-    }
-
     pub(crate) fn interrupted(&self) -> bool {
         self.interrupter.interrupted()
+    }
+
+    pub(crate) fn end_sent(&self) -> Arc<AtomicBool> {
+        self.ended.clone()
+    }
+
+    pub(crate) fn failed(&self) -> bool {
+        lock(&self.failure).is_some()
     }
 
     pub(crate) async fn enqueue(
@@ -191,36 +214,67 @@ impl BatchWriter {
         batch: RecordBatch,
         since: Option<Instant>,
         urgent: bool,
+        committed: impl FnOnce(),
     ) -> Result<()> {
         if batch.num_rows() == 0 {
+            committed();
             return Ok(());
         }
-        if self.interrupter.interrupted() {
-            return Err(interrupted_error());
-        }
-        let input = self.input()?.clone();
-        for (batch, bytes) in split(batch, self.target_bytes) {
-            let Some(permit) = self.queue.acquire(bytes).await else {
-                return Err(self.stopped().await);
-            };
-            if self.interrupter.interrupted() {
-                return Err(interrupted_error());
-            }
-            let queued = Queued {
+        self.drain().await?;
+        let mut pieces = split(batch, self.target_bytes)
+            .into_iter()
+            .map(|(batch, bytes)| Piece {
                 batch,
                 bytes,
                 since,
                 urgent,
-                permit,
+            });
+        if let Some(first) = pieces.next() {
+            let permit = self.permit(first.bytes).await?;
+            self.hand_over(first, permit).await?;
+        }
+        self.unsent.extend(pieces);
+        committed();
+        self.drain().await
+    }
+
+    pub(crate) async fn drain(&mut self) -> Result<()> {
+        while let Some(bytes) = self.unsent.front().map(|piece| piece.bytes) {
+            let permit = self.permit(bytes).await?;
+            let Some(piece) = self.unsent.pop_front() else {
+                break;
             };
-            if input.send(Input::Batch(queued)).is_err() {
-                return Err(self.stopped().await);
-            }
+            self.hand_over(piece, permit).await?;
+        }
+        Ok(())
+    }
+
+    async fn permit(&mut self, bytes: usize) -> Result<Permits> {
+        if self.interrupter.interrupted() {
+            return Err(interrupted_error());
+        }
+        let Some(permit) = self.queue.acquire(bytes).await else {
+            return Err(self.stopped().await);
+        };
+        if self.interrupter.interrupted() {
+            return Err(interrupted_error());
+        }
+        Ok(permit)
+    }
+
+    async fn hand_over(&mut self, piece: Piece, permit: Permits) -> Result<()> {
+        if self
+            .input()?
+            .send(Input::Batch(piece.queued(permit)))
+            .is_err()
+        {
+            return Err(self.stopped().await);
         }
         Ok(())
     }
 
     pub(crate) async fn flush(&mut self) -> Result<()> {
+        self.drain().await?;
         let (done, flushed) = oneshot::channel();
         if self.input()?.send(Input::Flush(done)).is_err() {
             return Err(self.stopped().await);
@@ -256,6 +310,7 @@ impl BatchWriter {
         }
         match lock(&self.failure).take() {
             Some(error) => Err(error),
+            None if self.interrupter.interrupted() => Err(interrupted_error()),
             None => Ok(()),
         }
     }
@@ -398,30 +453,10 @@ impl Queue {
     }
 }
 
-struct Notifier {
-    connection: Connection,
-    locator: String,
-    status: Arc<Status>,
-}
-
-impl Notifier {
-    async fn record_dropped(&self, count: u64) {
-        let message = format!(
-            "{count} record(s) dropped for topic '{}': a single record exceeds the message size limit",
-            self.locator
-        );
-        self.status.record_dropped(count, message.clone());
-        let _ = self
-            .connection
-            .notify_error(ActionKind::TopicNotificationCreate, &self.locator, message)
-            .await;
-    }
-}
-
 struct Encoding {
     encoder: Arc<Encoder>,
     frames: mpsc::Sender<Frame>,
-    notifier: Notifier,
+    reporter: Arc<Reporter>,
     interrupter: Interrupter,
 }
 
@@ -438,17 +473,29 @@ impl Encoding {
         let (flights, dropped) = tokio::task::spawn_blocking(move || worker.encode_all(batches))
             .await
             .map_err(|e| Error::new(ErrorKind::Stream, "encoding task failed").with_source(e))??;
-        for flight in flights {
+        let last = flights.len().saturating_sub(1);
+        let mut permits = Some(permits);
+        for (index, flight) in flights.into_iter().enumerate() {
             if self.interrupter.interrupted() {
                 break;
             }
-            if self.frames.send(Frame::Data(flight)).await.is_err() {
+            let carried = match index == last {
+                true => permits.take().unwrap_or_default(),
+                false => Vec::new(),
+            };
+            if self
+                .frames
+                .send(Frame::Data(flight, carried))
+                .await
+                .is_err()
+            {
                 return Ok(false);
             }
         }
-        drop(permits);
-        if dropped > 0 {
-            self.notifier.record_dropped(dropped).await;
+        if dropped.count > 0 {
+            self.reporter
+                .record_dropped(dropped.count, dropped.largest, false)
+                .await;
         }
         Ok(true)
     }
@@ -483,7 +530,12 @@ async fn encode_loop(
     encoding: Encoding,
     mut pressure: Option<watch::Receiver<u64>>,
 ) -> Result<()> {
-    if encoding.frames.send(Frame::Data(header)).await.is_err() {
+    if encoding
+        .frames
+        .send(Frame::Data(header, Vec::new()))
+        .await
+        .is_err()
+    {
         return Ok(());
     }
     loop {
@@ -525,13 +577,71 @@ async fn encode_loop(
     Err(Error::new(ErrorKind::Closed, "topic writer dropped"))
 }
 
-async fn upload(connection: Connection, outgoing: mpsc::Receiver<Frame>) -> Result<()> {
-    let stream = futures::stream::unfold(outgoing, |mut outgoing| async move {
-        match outgoing.recv().await {
-            Some(Frame::Data(data)) => Some((data, outgoing)),
-            Some(Frame::End) => None,
+struct Outgoing {
+    frames: mpsc::Receiver<Frame>,
+    pressure: Option<watch::Receiver<u64>>,
+    held: VecDeque<Vec<Permits>>,
+    ended: Arc<AtomicBool>,
+}
+
+enum Wait {
+    Frame(Option<Frame>),
+    Pressure,
+    PressureGone,
+}
+
+impl Outgoing {
+    async fn next(&mut self) -> Option<FlightData> {
+        let frame = match self.frames.try_recv() {
+            Ok(frame) => Some(frame),
+            Err(mpsc::error::TryRecvError::Disconnected) => None,
+            Err(mpsc::error::TryRecvError::Empty) => self.wait().await,
+        };
+        match frame {
+            Some(Frame::Data(data, permits)) => {
+                self.held.push_back(permits);
+                while self.held.len() > IN_FLIGHT {
+                    self.held.pop_front();
+                }
+                Some(data)
+            }
+            Some(Frame::End) => {
+                self.ended.store(true, Ordering::Relaxed);
+                self.held.clear();
+                None
+            }
             None => futures::future::pending().await,
         }
+    }
+
+    async fn wait(&mut self) -> Option<Frame> {
+        loop {
+            let waited = match self.pressure.as_mut() {
+                Some(pressure) if !self.held.is_empty() => {
+                    pressure.borrow_and_update();
+                    let changed = pin!(pressure.changed());
+                    let received = pin!(self.frames.recv());
+                    match futures::future::select(changed, received).await {
+                        Either::Left((Ok(()), _)) => Wait::Pressure,
+                        Either::Left((Err(_), _)) => Wait::PressureGone,
+                        Either::Right((frame, _)) => Wait::Frame(frame),
+                    }
+                }
+                _ => Wait::Frame(self.frames.recv().await),
+            };
+            match waited {
+                Wait::Frame(frame) => return frame,
+                Wait::Pressure => self.held.clear(),
+                Wait::PressureGone => self.pressure = None,
+            }
+        }
+    }
+}
+
+async fn upload(connection: Connection, outgoing: Outgoing) -> Result<()> {
+    let stream = futures::stream::unfold(outgoing, |mut outgoing| async move {
+        let data = outgoing.next().await?;
+        Some((data, outgoing))
     });
     let mut results = connection.do_put(stream).await?;
     while results.message().await?.is_some() {}
@@ -546,10 +656,184 @@ fn lock(failure: &Failure) -> MutexGuard<'_, Option<Error>> {
 mod tests {
     use std::time::Duration;
 
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::Int64Type;
+    use arrow_array::{ArrayRef, Int64Array};
+    use arrow_schema::Field;
+
     use super::*;
 
+    fn idle_writer(target: usize) -> (BatchWriter, mpsc::UnboundedReceiver<Input>) {
+        let (input, received) = mpsc::unbounded_channel();
+        let writer = BatchWriter {
+            input: Some(input),
+            schema: Arc::new(Schema::new(vec![Field::new("t", DataType::Int64, false)])),
+            shapes: vec![shape(&DataType::Int64)],
+            accepted: None,
+            target_bytes: target,
+            record_limit: target,
+            queue: Queue::new(target, Arc::new(WriteBudget::new(1 << 20))),
+            unsent: VecDeque::new(),
+            failure: Failure::default(),
+            ended: Arc::new(AtomicBool::new(false)),
+            interrupter: Interrupter::default(),
+            task: None,
+        };
+        (writer, received)
+    }
+
+    fn rows(values: std::ops::Range<i64>) -> RecordBatch {
+        let column: ArrayRef = Arc::new(Int64Array::from_iter_values(values));
+        RecordBatch::try_from_iter([("t", column)]).unwrap()
+    }
+
+    fn values(input: Input) -> Vec<i64> {
+        match input {
+            Input::Batch(queued) => queued
+                .batch
+                .column(0)
+                .as_primitive::<Int64Type>()
+                .values()
+                .to_vec(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn queued(received: &mut mpsc::UnboundedReceiver<Input>) -> Vec<i64> {
+        let mut sent = Vec::new();
+        while let Ok(input) = received.try_recv() {
+            sent.extend(values(input));
+        }
+        sent
+    }
+
     #[tokio::test]
-    async fn an_item_never_waits_for_more_than_one_message() {
+    async fn cancelled_enqueue_sends_rest() {
+        let (mut writer, mut received) = idle_writer(80);
+        let full = (QUEUE_MESSAGES * 10) as i64;
+        let mut committed = false;
+        let enqueue = writer.enqueue(rows(0..100), None, false, || committed = true);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), enqueue)
+                .await
+                .is_err()
+        );
+        assert!(committed);
+        let mut sent = queued(&mut received);
+        assert_eq!(sent, (0..full).collect::<Vec<_>>());
+        let rest = tokio::spawn(async move {
+            let mut rest = Vec::new();
+            while let Some(input) = received.recv().await {
+                rest.extend(values(input));
+            }
+            rest
+        });
+        writer.drain().await.unwrap();
+        drop(writer);
+        sent.extend(rest.await.unwrap());
+        assert_eq!(sent, (0..100).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn cancelled_enqueue_leaves_nothing() {
+        let (mut writer, mut received) = idle_writer(80);
+        let full = (QUEUE_MESSAGES * 10) as i64;
+        writer
+            .enqueue(rows(0..full), None, false, || {})
+            .await
+            .unwrap();
+        let mut committed = false;
+        let enqueue = writer.enqueue(rows(full..full + 10), None, false, || committed = true);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), enqueue)
+                .await
+                .is_err()
+        );
+        assert!(!committed);
+        assert!(writer.unsent.is_empty());
+        assert_eq!(queued(&mut received), (0..full).collect::<Vec<_>>());
+    }
+
+    fn outgoing(
+        received: mpsc::Receiver<Frame>,
+        pressure: Option<watch::Receiver<u64>>,
+    ) -> Outgoing {
+        Outgoing {
+            frames: received,
+            pressure,
+            held: VecDeque::new(),
+            ended: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[tokio::test]
+    async fn permits_held_two_frames() {
+        let queue = Queue::new(10, Arc::new(WriteBudget::new(1000)));
+        let free = || queue.semaphore.available_permits();
+        let (frames, received) = mpsc::channel(8);
+        let mut outgoing = outgoing(received, None);
+        for _ in 0..3 {
+            let permits = vec![queue.acquire(10).await.unwrap()];
+            frames
+                .send(Frame::Data(FlightData::default(), permits))
+                .await
+                .unwrap();
+        }
+        let full = 10 * QUEUE_MESSAGES;
+        assert_eq!(free(), full - 30);
+        outgoing.next().await.unwrap();
+        outgoing.next().await.unwrap();
+        assert_eq!(free(), full - 30);
+        outgoing.next().await.unwrap();
+        assert_eq!(free(), full - 20);
+        frames.send(Frame::End).await.unwrap();
+        assert!(outgoing.next().await.is_none());
+        assert_eq!(free(), full);
+        assert!(outgoing.ended.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn idle_topic_frees_permits() {
+        let budget = Arc::new(WriteBudget::new(10));
+        let queue = Queue::new(10, budget.clone());
+        let (frames, received) = mpsc::channel(8);
+        let mut outgoing = outgoing(received, Some(budget.pressure()));
+        let permits = vec![queue.acquire(10).await.unwrap()];
+        frames
+            .send(Frame::Data(FlightData::default(), permits))
+            .await
+            .unwrap();
+        outgoing.next().await.unwrap();
+        let idle = tokio::spawn(async move { outgoing.next().await.is_none() });
+        let other = Semaphore::new(100);
+        let waiting = tokio::time::timeout(Duration::from_secs(1), budget.acquire(10, &other));
+        assert!(waiting.await.is_ok_and(|permit| permit.is_some()));
+        frames.send(Frame::End).await.unwrap();
+        assert!(idle.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn permits_kept_without_pressure() {
+        let budget = Arc::new(WriteBudget::new(10));
+        let queue = Queue::new(10, budget.clone());
+        let (frames, received) = mpsc::channel(8);
+        let mut outgoing = outgoing(received, None);
+        let permits = vec![queue.acquire(10).await.unwrap()];
+        frames
+            .send(Frame::Data(FlightData::default(), permits))
+            .await
+            .unwrap();
+        outgoing.next().await.unwrap();
+        let idle = tokio::spawn(async move { outgoing.next().await.is_none() });
+        let other = Semaphore::new(100);
+        let waiting = tokio::time::timeout(Duration::from_millis(100), budget.acquire(10, &other));
+        assert!(waiting.await.is_err());
+        frames.send(Frame::End).await.unwrap();
+        assert!(idle.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn item_waits_one_message() {
         let queue = Queue::new(100, Arc::new(WriteBudget::new(1000)));
         let _held = queue.acquire(99).await.unwrap();
         let large = tokio::time::timeout(Duration::from_secs(1), queue.acquire(10_000)).await;

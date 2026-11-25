@@ -3,6 +3,8 @@ use std::time::Duration;
 
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::{Action, Criteria, FlightData, FlightDescriptor, FlightInfo, PutResult, Ticket};
+use arrow_ipc::CompressionType;
+use arrow_ipc::writer::IpcWriteOptions;
 use futures::Stream;
 use prost::Message;
 use tokio::time::Instant;
@@ -15,9 +17,9 @@ use tonic::{Request, Status, Streaming};
 
 use super::action::ActionKind;
 use super::proto;
+use crate::comm::budget::WriteBudget;
 use crate::error::{Error, ErrorKind, Result};
 use crate::scope::Scope;
-use crate::write::batch_writer::WriteBudget;
 
 const CONNECT_RETRY: Duration = Duration::from_millis(25);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -31,6 +33,7 @@ const API_KEY_HEADER: &str = "mosaico-api-key-token";
 type Client = FlightServiceClient<InterceptedService<Channel, ApiKey>>;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Compression {
     #[default]
     None,
@@ -40,6 +43,7 @@ pub enum Compression {
 }
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ConnectOptions {
     pub host: String,
     pub port: u16,
@@ -62,9 +66,35 @@ impl ConnectOptions {
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
         }
     }
+
+    pub fn tls(mut self, tls: bool) -> Self {
+        self.tls = tls;
+        self
+    }
+
+    pub fn tls_cert(mut self, pem: Vec<u8>) -> Self {
+        self.tls_cert = Some(pem);
+        self
+    }
+
+    pub fn api_key(mut self, key: impl Into<String>) -> Self {
+        self.api_key = Some(key.into());
+        self
+    }
+
+    pub fn compression(mut self, compression: Compression) -> Self {
+        self.compression = compression;
+        self
+    }
+
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
+        self
+    }
 }
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ServerInfo {
     pub version: String,
     pub max_decode_message_size: u64,
@@ -74,7 +104,7 @@ pub struct ServerInfo {
 
 impl ServerInfo {
     pub fn max_batch_size_bytes(&self) -> u64 {
-        self.max_decode_message_size / 10 * 9
+        self.max_decode_message_size - self.max_decode_message_size.div_ceil(10)
     }
 }
 
@@ -114,16 +144,15 @@ impl Interceptor for ApiKey {
 pub(crate) struct Connection {
     client: Client,
     info: ServerInfo,
-    compression: Compression,
+    write_options: IpcWriteOptions,
     scope: Scope,
-    endpoint: Endpoint,
-    api_key: ApiKey,
     budget: Arc<WriteBudget>,
 }
 
 impl Connection {
     pub(crate) async fn connect(options: ConnectOptions) -> Result<Self> {
         let api_key = ApiKey::new(options.api_key.as_deref())?;
+        let write_options = write_options(options.compression)?;
         let tls = options.tls || options.tls_cert.is_some();
         let scheme = if tls { "https" } else { "http" };
         let address = format!("{scheme}://{}:{}", options.host, options.port);
@@ -157,28 +186,9 @@ impl Connection {
             client: flight_client(channel, &api_key, &info, options.compression),
             budget: Arc::new(WriteBudget::for_server(&info)),
             info,
-            compression: options.compression,
+            write_options,
             scope: Scope::root(),
-            endpoint,
-            api_key,
         })
-    }
-
-    pub(crate) fn dedicated(&self) -> Self {
-        Self {
-            client: flight_client(
-                open_channel(&self.endpoint),
-                &self.api_key,
-                &self.info,
-                self.compression,
-            ),
-            info: self.info.clone(),
-            compression: self.compression,
-            scope: self.scope.clone(),
-            endpoint: self.endpoint.clone(),
-            api_key: self.api_key.clone(),
-            budget: self.budget.clone(),
-        }
     }
 
     pub(crate) fn write_budget(&self) -> &Arc<WriteBudget> {
@@ -189,8 +199,8 @@ impl Connection {
         &self.info
     }
 
-    pub(crate) fn compression(&self) -> Compression {
-        self.compression
+    pub(crate) fn write_options(&self) -> &IpcWriteOptions {
+        &self.write_options
     }
 
     pub(crate) fn scope(&self) -> &Scope {
@@ -287,6 +297,40 @@ impl Connection {
     }
 }
 
+fn write_options(compression: Compression) -> Result<IpcWriteOptions> {
+    let codec = match compression {
+        Compression::None | Compression::Gzip => None,
+        Compression::Lz4 => Some(CompressionType::LZ4_FRAME),
+        Compression::Zstd => Some(CompressionType::ZSTD),
+    };
+    IpcWriteOptions::default()
+        .try_with_compression(codec)
+        .map_err(|e| {
+            Error::new(ErrorKind::InvalidArgument, "invalid IPC compression").with_source(e)
+        })
+}
+
+#[cfg(test)]
+impl Connection {
+    pub(crate) fn offline(max_message_size: u64) -> Self {
+        let info = ServerInfo {
+            version: String::new(),
+            max_decode_message_size: max_message_size,
+            max_encode_message_size: max_message_size,
+            target_encode_message_size: max_message_size,
+        };
+        let endpoint = Endpoint::from_static("http://127.0.0.1:1");
+        let api_key = ApiKey(None);
+        Self {
+            client: flight_client(open_channel(&endpoint), &api_key, &info, Compression::None),
+            budget: Arc::new(WriteBudget::for_server(&info)),
+            info,
+            write_options: write_options(Compression::None).unwrap(),
+            scope: Scope::root(),
+        }
+    }
+}
+
 async fn do_action(mut client: Client, action: ActionKind, body: Vec<u8>) -> Result<Vec<Vec<u8>>> {
     let response = client.do_action(Action::new(action.as_str(), body)).await?;
     let mut results = response.into_inner();
@@ -379,5 +423,43 @@ fn flight_client(
             .send_compressed(CompressionEncoding::Gzip)
             .accept_compressed(CompressionEncoding::Gzip),
         Compression::None | Compression::Lz4 | Compression::Zstd => client,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connect_options_builder() {
+        let options = ConnectOptions::new("localhost", 6726)
+            .tls(true)
+            .tls_cert(b"pem".to_vec())
+            .api_key("key")
+            .compression(Compression::Zstd)
+            .connect_timeout(Duration::from_secs(3));
+        assert!(options.tls);
+        assert_eq!(options.tls_cert.as_deref(), Some(&b"pem"[..]));
+        assert_eq!(options.api_key.as_deref(), Some("key"));
+        assert_eq!(options.compression, Compression::Zstd);
+        assert_eq!(options.connect_timeout, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn max_batch_size_bytes() {
+        for (limit, want) in [
+            (4_194_304, 3_774_873),
+            (52_428_800, 47_185_920),
+            (536_870_912, 483_183_820),
+            (u64::MAX, 16_602_069_666_338_596_453),
+        ] {
+            let info = ServerInfo {
+                version: String::new(),
+                max_decode_message_size: limit,
+                max_encode_message_size: limit,
+                target_encode_message_size: limit,
+            };
+            assert_eq!(info.max_batch_size_bytes(), want, "limit {limit}");
+        }
     }
 }

@@ -176,7 +176,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn small_writes_reach_the_socket_together_and_in_order() {
+    async fn small_writes_coalesce() {
         let writes = Arc::new(AtomicUsize::new(0));
         let mut io = BufferedWrites::new(Recorder {
             writes: writes.clone(),
@@ -195,7 +195,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_second_flush_sends_what_is_buffered() {
+    async fn second_flush_sends_buffer() {
         let mut io = BufferedWrites::new(Recorder::default());
         io.write_all(b"ping").await.unwrap();
         io.flush().await.unwrap();
@@ -205,7 +205,7 @@ mod tests {
     }
 
     #[test]
-    fn a_read_sends_what_a_deferred_flush_kept_first() {
+    fn read_sends_deferred_flush() {
         let mut io = BufferedWrites::new(Recorder::default());
         let mut cx = Context::from_waker(std::task::Waker::noop());
         let written = Pin::new(&mut io).poll_write(&mut cx, b"client hello");
@@ -219,7 +219,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn large_writes_skip_the_buffer_and_shutdown_drains() {
+    async fn large_writes_skip_buffer() {
         let mut io = BufferedWrites::new(Recorder::default());
         let large = pattern(FLUSH_AT + 1);
         io.write_all(b"head").await.unwrap();

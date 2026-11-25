@@ -3,11 +3,9 @@ use std::collections::VecDeque;
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, OffsetSizeTrait, RecordBatch};
 use arrow_flight::FlightData;
-use arrow_ipc::CompressionType;
 use arrow_ipc::writer::{CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions};
 use arrow_schema::{DataType, SchemaRef};
 
-use crate::comm::connection::Compression;
 use crate::error::{Error, ErrorKind, Result};
 
 pub(super) struct Encoder {
@@ -17,7 +15,10 @@ pub(super) struct Encoder {
 }
 
 impl Encoder {
-    pub(super) fn encode_all(&self, batches: Vec<RecordBatch>) -> Result<(Vec<FlightData>, u64)> {
+    pub(super) fn encode_all(
+        &self,
+        batches: Vec<RecordBatch>,
+    ) -> Result<(Vec<FlightData>, Dropped)> {
         let batch = match <[RecordBatch; 1]>::try_from(batches) {
             Ok([batch]) => batch,
             Err(batches) => arrow_select::concat::concat_batches(&self.schema, &batches)
@@ -26,12 +27,12 @@ impl Encoder {
         self.encode(batch)
     }
 
-    fn encode(&self, batch: RecordBatch) -> Result<(Vec<FlightData>, u64)> {
+    fn encode(&self, batch: RecordBatch) -> Result<(Vec<FlightData>, Dropped)> {
         let generator = IpcDataGenerator::default();
         let mut compression = CompressionContext::default();
         let mut pending = VecDeque::from([batch]);
         let mut out = Vec::new();
-        let mut dropped = 0;
+        let mut dropped = Dropped::default();
         while let Some(batch) = pending.pop_front() {
             let mut tracker = DictionaryTracker::new(false);
             let (dictionaries, data) = generator
@@ -46,7 +47,8 @@ impl Encoder {
                 out.extend(dictionaries.into_iter().map(FlightData::from));
                 out.push(FlightData::from(data));
             } else if batch.num_rows() <= 1 {
-                dropped += 1;
+                dropped.count += 1;
+                dropped.largest = dropped.largest.max(size);
             } else {
                 let half = batch.num_rows() / 2;
                 pending.push_front(batch.slice(half, batch.num_rows() - half));
@@ -55,6 +57,12 @@ impl Encoder {
         }
         Ok((out, dropped))
     }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct Dropped {
+    pub(super) count: u64,
+    pub(super) largest: usize,
 }
 
 pub(super) fn split(batch: RecordBatch, target: usize) -> Vec<(RecordBatch, usize)> {
@@ -74,7 +82,7 @@ pub(super) fn split(batch: RecordBatch, target: usize) -> Vec<(RecordBatch, usiz
         .collect()
 }
 
-fn estimate(batch: &RecordBatch) -> usize {
+pub(crate) fn estimate(batch: &RecordBatch) -> usize {
     batch
         .columns()
         .iter()
@@ -122,14 +130,6 @@ fn list_bytes<O: OffsetSizeTrait>(list: &arrow_array::GenericListArray<O>) -> us
     std::mem::size_of_val(offsets) + slice_bytes(list.values().slice(first, last - first).as_ref())
 }
 
-pub(super) fn ipc_compression(compression: Compression) -> Option<CompressionType> {
-    match compression {
-        Compression::None | Compression::Gzip => None,
-        Compression::Lz4 => Some(CompressionType::LZ4_FRAME),
-        Compression::Zstd => Some(CompressionType::ZSTD),
-    }
-}
-
 #[cfg(test)]
 mod tests {
 
@@ -143,7 +143,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn estimate_counts_only_the_rows_of_a_slice() {
+    fn oversized_row_dropped() {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![Field::new(
+            "data",
+            DataType::Binary,
+            false,
+        )]));
+        let rows: Vec<Vec<u8>> = [10, 5000, 20, 3000].map(|size| vec![1; size]).to_vec();
+        let column: ArrayRef = Arc::new(arrow_array::BinaryArray::from_iter_values(&rows));
+        let batch = RecordBatch::try_new(schema.clone(), vec![column]).unwrap();
+        let encoder = Encoder {
+            schema,
+            options: IpcWriteOptions::default(),
+            limit: 1024,
+        };
+        let (flights, dropped) = encoder.encode_all(vec![batch]).unwrap();
+        assert_eq!(dropped.count, 2);
+        assert!((5000..6000).contains(&dropped.largest), "{dropped:?}");
+        assert_eq!(flights.len(), 2);
+    }
+
+    #[test]
+    fn estimate_slice() {
         let rows = 1000;
         let values = Float64Array::from_iter_values((0..rows * 9).map(|v| v as f64));
         let item = Arc::new(Field::new_list_field(DataType::Float64, true));
