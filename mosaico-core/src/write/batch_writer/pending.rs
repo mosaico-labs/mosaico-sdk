@@ -11,6 +11,7 @@ pub(super) struct Pending {
     pub(super) policy: FlushPolicy,
     pub(super) queued: Vec<Queued>,
     pub(super) bytes: usize,
+    pub(super) cost: usize,
     pub(super) rows: usize,
     pub(super) since: Option<Instant>,
 }
@@ -22,8 +23,9 @@ impl Pending {
             .map_or(self.target, |bytes| bytes.min(self.target))
     }
 
-    fn exceeded_by(&self, bytes: usize, rows: usize) -> bool {
+    fn exceeded_by(&self, bytes: usize, cost: usize, rows: usize) -> bool {
         self.bytes + bytes > self.max_bytes()
+            || self.cost + cost > self.target
             || self
                 .policy
                 .max_rows
@@ -33,6 +35,7 @@ impl Pending {
     fn full(&self) -> bool {
         self.queued.len() >= MAX_QUEUED
             || self.bytes >= self.max_bytes()
+            || self.cost >= self.target
             || self.policy.max_rows.is_some_and(|max| self.rows >= max)
             || self
                 .policy
@@ -44,12 +47,13 @@ impl Pending {
     pub(super) fn add(&mut self, item: Queued) -> Vec<Vec<Queued>> {
         let rows = item.batch.num_rows();
         let mut ready = Vec::new();
-        if !self.queued.is_empty() && self.exceeded_by(item.bytes, rows) {
+        if !self.queued.is_empty() && self.exceeded_by(item.bytes, item.cost, rows) {
             ready.extend(self.take());
         }
         let since = item.since.unwrap_or_else(Instant::now);
         self.since = Some(self.since.map_or(since, |held| held.min(since)));
         self.bytes += item.bytes;
+        self.cost += item.cost;
         self.rows += rows;
         let urgent = item.urgent;
         self.queued.push(item);
@@ -70,6 +74,7 @@ impl Pending {
 
     pub(super) fn take(&mut self) -> Option<Vec<Queued>> {
         self.bytes = 0;
+        self.cost = 0;
         self.rows = 0;
         self.since = None;
         if self.queued.is_empty() {
@@ -99,6 +104,7 @@ mod tests {
             policy,
             queued: Vec::new(),
             bytes: 0,
+            cost: 0,
             rows: 0,
             since: None,
         }
@@ -115,6 +121,7 @@ mod tests {
         Queued {
             batch,
             bytes,
+            cost: bytes,
             since: None,
             urgent: false,
             permit,
@@ -217,6 +224,18 @@ mod tests {
             assert!(pending.add(queued(1, 0)).is_empty());
         }
         assert_eq!(sizes(&pending.add(queued(1, 0))), [MAX_QUEUED]);
+    }
+
+    #[test]
+    fn cost_fills_group() {
+        let mut pending = pending(FlushPolicy::default());
+        let costly = |bytes| Queued {
+            cost: 60,
+            ..queued(1, bytes)
+        };
+        assert!(pending.add(costly(1)).is_empty());
+        assert_eq!(sizes(&pending.add(costly(1))), [1]);
+        assert_eq!(pending.bytes, 1);
     }
 
     #[test]

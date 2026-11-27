@@ -116,11 +116,24 @@ fn slice_bytes(array: &dyn Array) -> usize {
         DataType::FixedSizeList(_, _) => {
             nulls + slice_bytes(array.as_fixed_size_list().values().as_ref())
         }
+        DataType::BinaryView => nulls + view_bytes(array, array.as_binary_view().views()),
+        DataType::Utf8View => nulls + view_bytes(array, array.as_string_view().views()),
         _ => array
             .to_data()
             .get_slice_memory_size()
             .unwrap_or_else(|_| array.get_array_memory_size()),
     }
+}
+
+fn view_bytes(array: &dyn Array, views: &[u128]) -> usize {
+    views
+        .iter()
+        .enumerate()
+        .map(|(i, view)| match *view as u32 as usize {
+            length if length > 12 && array.is_valid(i) => 16 + length,
+            _ => 16,
+        })
+        .sum()
 }
 
 fn list_bytes<O: OffsetSizeTrait>(list: &arrow_array::GenericListArray<O>) -> usize {
@@ -135,7 +148,9 @@ mod tests {
 
     use std::sync::Arc;
 
-    use arrow_array::{ArrayRef, Float64Array, ListArray, StructArray};
+    use arrow_array::{
+        ArrayRef, BinaryViewArray, Float64Array, ListArray, StringViewArray, StructArray,
+    };
     use arrow_buffer::OffsetBuffer;
 
     use arrow_schema::{DataType, Field};
@@ -190,6 +205,26 @@ mod tests {
             assert_eq!(flights.len(), 1);
             assert_eq!(dropped, Dropped::default());
         }
+    }
+
+    #[test]
+    fn view_data_counted() {
+        let big = vec![1u8; 1 << 20];
+        let values = [big.as_slice(), b"tiny", big.as_slice()];
+        let view: ArrayRef = Arc::new(BinaryViewArray::from_iter_values(values));
+        let text: ArrayRef = Arc::new(StringViewArray::from_iter_values(["a", "b"]));
+        let batch = RecordBatch::try_from_iter([("data", view)]).unwrap();
+        assert_eq!(estimate(&batch.slice(1, 1)), 16);
+        assert_eq!(estimate(&batch.slice(2, 1)), 16 + (1 << 20));
+        assert!(estimate(&batch) > 2 << 20);
+        let batch = RecordBatch::try_from_iter([("text", text)]).unwrap();
+        assert_eq!(estimate(&batch), 32);
+        let full = BinaryViewArray::from_iter_values([big.as_slice(), big.as_slice()]);
+        let nulls = arrow_buffer::NullBuffer::from(vec![true, false]);
+        let (views, buffers, _) = full.into_parts();
+        let nulled: ArrayRef = Arc::new(BinaryViewArray::new(views, buffers, Some(nulls)));
+        let batch = RecordBatch::try_from_iter([("data", nulled)]).unwrap();
+        assert_eq!(estimate(&batch.slice(1, 1)), 16 + 1);
     }
 
     #[test]

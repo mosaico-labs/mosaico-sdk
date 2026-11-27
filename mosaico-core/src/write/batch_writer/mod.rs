@@ -44,6 +44,7 @@ enum Input {
 struct Queued {
     batch: RecordBatch,
     bytes: usize,
+    cost: usize,
     since: Option<Instant>,
     urgent: bool,
     permit: Permits,
@@ -68,6 +69,7 @@ impl Piece {
 
     fn queued(self, permit: Permits) -> Queued {
         Queued {
+            cost: self.cost(),
             batch: self.batch,
             bytes: self.bytes,
             since: self.since,
@@ -141,6 +143,7 @@ impl BatchWriter {
             policy: FlushPolicy::default(),
             queued: Vec::new(),
             bytes: 0,
+            cost: 0,
             rows: 0,
             since: None,
         };
@@ -846,6 +849,67 @@ mod tests {
         let _held = queue.acquire(99).await.unwrap();
         let large = tokio::time::timeout(Duration::from_secs(1), queue.acquire(10_000)).await;
         assert!(large.is_ok_and(|permit| permit.is_some()));
+    }
+
+    async fn draining_server(listener: tokio::net::TcpListener) {
+        loop {
+            let (socket, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut conn = h2::server::handshake(socket).await.unwrap();
+                while let Some(Ok((request, mut respond))) = conn.accept().await {
+                    tokio::spawn(async move {
+                        let mut body = request.into_body();
+                        while let Some(Ok(chunk)) = body.data().await {
+                            let _ = body.flow_control().release_capacity(chunk.len());
+                        }
+                        let response = http::Response::builder()
+                            .header("content-type", "application/grpc")
+                            .body(())
+                            .unwrap();
+                        let mut send = respond.send_response(response, false).unwrap();
+                        let mut trailers = http::HeaderMap::new();
+                        trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
+                        let _ = send.send_trailers(trailers);
+                    });
+                }
+            });
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tiny_batches_no_hang() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(draining_server(listener));
+        let connection = Connection::offline_at(1 << 20, port);
+        let reporter = Arc::new(Reporter::new(
+            "/t".to_owned(),
+            "run/t".to_owned(),
+            connection.clone(),
+        ));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "timestamp_ns",
+            DataType::Int64,
+            false,
+        )]));
+        let mut writer = BatchWriter::open(
+            &connection,
+            reporter,
+            String::new(),
+            schema,
+            connection.scope().token(),
+            Interrupter::new(),
+        );
+        for i in 0..12_000 {
+            let column: ArrayRef = Arc::new(Int64Array::from(vec![i]));
+            let batch = RecordBatch::try_from_iter([("timestamp_ns", column)]).unwrap();
+            let pushed = tokio::time::timeout(
+                Duration::from_secs(5),
+                writer.enqueue(batch, None, false, || {}),
+            )
+            .await;
+            assert!(matches!(pushed, Ok(Ok(()))), "push {i} stuck");
+        }
     }
 
     #[test]
