@@ -16,6 +16,7 @@ use crate::data::header::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum ImageFormat {
     Raw,
     Png,
@@ -37,10 +38,6 @@ impl ImageFormat {
             Self::H264 => "h264",
             Self::Hevc => "hevc",
         }
-    }
-
-    pub fn is_stateful(self) -> bool {
-        matches!(self, Self::H264 | Self::Hevc)
     }
 
     fn parse(value: &str) -> Result<Self> {
@@ -344,5 +341,22 @@ impl Encode for CompressedImage {
 
     fn size(&self) -> usize {
         header_size(&self.header) + self.data.len() + self.format.as_str().len() + 8
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use mosaico_core::ErrorKind;
+
+    use super::*;
+
+    #[test]
+    fn format_round_trip() {
+        for format in ["raw", "png", "jpeg", "jpg", "tiff", "h264", "hevc"] {
+            assert_eq!(ImageFormat::from_str(format).unwrap().as_str(), format);
+        }
+        let error = ImageFormat::from_str("bogus").unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Schema);
+        assert!(error.to_string().contains("'bogus'"));
     }
 }

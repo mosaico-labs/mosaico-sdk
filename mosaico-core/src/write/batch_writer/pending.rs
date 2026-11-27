@@ -4,6 +4,8 @@ use crate::write::topic::FlushPolicy;
 
 use super::Queued;
 
+const MAX_QUEUED: usize = 4096;
+
 pub(super) struct Pending {
     pub(super) target: usize,
     pub(super) policy: FlushPolicy,
@@ -29,7 +31,8 @@ impl Pending {
     }
 
     fn full(&self) -> bool {
-        self.bytes >= self.max_bytes()
+        self.queued.len() >= MAX_QUEUED
+            || self.bytes >= self.max_bytes()
             || self.policy.max_rows.is_some_and(|max| self.rows >= max)
             || self
                 .policy
@@ -205,6 +208,15 @@ mod tests {
         assert!(pending.add(queued(1, 1)).is_empty());
         std::thread::sleep(Duration::from_millis(30));
         assert_eq!(sizes(&pending.add(queued(1, 1))), vec![2]);
+    }
+
+    #[test]
+    fn many_tiny_batches() {
+        let mut pending = pending(FlushPolicy::default());
+        for _ in 1..MAX_QUEUED {
+            assert!(pending.add(queued(1, 0)).is_empty());
+        }
+        assert_eq!(sizes(&pending.add(queued(1, 0))), [MAX_QUEUED]);
     }
 
     #[test]

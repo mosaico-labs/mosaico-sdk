@@ -3,17 +3,17 @@ use std::collections::HashSet;
 use arrow_schema::{DataType, Fields, Schema};
 
 use crate::error::{Error, Result};
-use crate::write::topic::TIMESTAMP;
+use crate::ontology::TIMESTAMP_COLUMN;
 
 pub(crate) fn check_schema(schema: &Schema) -> Result<()> {
     match schema
-        .field_with_name(TIMESTAMP)
+        .field_with_name(TIMESTAMP_COLUMN)
         .map(|field| field.data_type())
     {
         Ok(DataType::Int64) => {}
         _ => {
             return Err(Error::schema(format!(
-                "schema must have a '{TIMESTAMP}' column of type Int64"
+                "schema must have a '{TIMESTAMP_COLUMN}' column of type Int64"
             )));
         }
     }
@@ -72,7 +72,7 @@ mod tests {
     use crate::error::ErrorKind;
 
     fn schema(fields: Vec<Field>) -> Schema {
-        let mut all = vec![Field::new(TIMESTAMP, DataType::Int64, false)];
+        let mut all = vec![Field::new(TIMESTAMP_COLUMN, DataType::Int64, false)];
         all.extend(fields);
         Schema::new(all)
     }
@@ -106,13 +106,13 @@ mod tests {
     fn timestamp_must_be_int64() {
         let missing = Schema::new(vec![float("x")]);
         assert!(rejected(&missing).contains("'timestamp_ns' column of type Int64"));
-        let wrong = Schema::new(vec![Field::new(TIMESTAMP, DataType::Int32, false)]);
+        let wrong = Schema::new(vec![Field::new(TIMESTAMP_COLUMN, DataType::Int32, false)]);
         assert!(rejected(&wrong).contains("'timestamp_ns' column of type Int64"));
     }
 
     #[test]
     fn rejects_duplicate_names() {
-        let top = schema(vec![Field::new(TIMESTAMP, DataType::Int64, false)]);
+        let top = schema(vec![Field::new(TIMESTAMP_COLUMN, DataType::Int64, false)]);
         assert_eq!(rejected(&top), "duplicate field 'timestamp_ns'");
         let nested = schema(vec![structure("pose", vec![float("x"), float("x")])]);
         assert_eq!(rejected(&nested), "duplicate field 'pose.x'");

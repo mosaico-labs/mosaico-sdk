@@ -5,6 +5,7 @@ use arrow_schema::SchemaRef;
 use crate::comm::connection::Connection;
 use crate::error::{Error, ErrorKind, Result};
 use crate::locator::{self, new_topic_name};
+use crate::metadata::UserMetadata;
 use crate::ontology::{Encode, Format};
 use crate::write::batch_writer::BatchWriter;
 use crate::write::rows::record_schema;
@@ -23,7 +24,7 @@ impl SequenceWriter {
     pub(crate) async fn create(
         connection: &Connection,
         name: &str,
-        metadata: Option<Vec<u8>>,
+        metadata: Option<&UserMetadata>,
         on_error: SessionLevelErrorPolicy,
     ) -> Result<Self> {
         let session = Session::create(connection, name, metadata, on_error).await?;
@@ -63,9 +64,12 @@ impl SequenceWriter {
         ontology_tag: &str,
         format: Format,
         schema: SchemaRef,
-        metadata: Option<Vec<u8>>,
+        metadata: Option<&UserMetadata>,
         on_error: TopicLevelErrorPolicy,
     ) -> Result<TopicWriter> {
+        if self.session.interrupter().interrupted() {
+            return Err(interrupted_error());
+        }
         let name = new_topic_name(topic_name)?;
         if self.topics.iter().any(|topic| topic.name() == name) {
             return Err(Error::new(
@@ -102,7 +106,7 @@ impl SequenceWriter {
     pub async fn topic_create_for<T: Encode>(
         &mut self,
         topic_name: &str,
-        metadata: Option<Vec<u8>>,
+        metadata: Option<&UserMetadata>,
         on_error: TopicLevelErrorPolicy,
     ) -> Result<TopicWriter> {
         let schema = record_schema::<T>();
@@ -226,6 +230,32 @@ mod tests {
                 interrupted_error()
             )));
         }
+    }
+
+    #[tokio::test]
+    async fn interrupted_topic_create() {
+        let mut writer = offline(SessionLevelErrorPolicy::Report);
+        writer.session.interrupter().interrupt();
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "timestamp_ns",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let Err(error) = writer
+            .topic_create(
+                "/imu",
+                "IMU",
+                Format::Default,
+                schema,
+                None,
+                TopicLevelErrorPolicy::Finalize,
+            )
+            .await
+        else {
+            panic!("topic created after an interrupt");
+        };
+        assert_eq!(error.to_string(), interrupted_error().to_string());
+        assert!(writer.topics.is_empty());
     }
 
     #[tokio::test]

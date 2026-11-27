@@ -11,12 +11,11 @@ use crate::comm::action::ActionKind;
 use crate::comm::budget::limits;
 use crate::comm::connection::Connection;
 use crate::error::{Error, ErrorKind, Result};
-use crate::ontology::{Encode, Format};
+use crate::ontology::{Encode, Format, TIMESTAMP_COLUMN};
+use crate::time::Timestamp;
 use crate::write::batch_writer::{BatchWriter, estimate};
 use crate::write::rows::{BatchRows, Chunk, Ready, RowBuffer, Rows};
 use crate::write::session::interrupted_error;
-
-pub(super) const TIMESTAMP: &str = "timestamp_ns";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -95,7 +94,12 @@ impl TopicWriter {
         self.topic.settle(&mut guard, result).await.map(drop)
     }
 
-    pub async fn push<T: Encode>(&self, timestamp_ns: i64, value: &T) -> Result<()> {
+    pub async fn push<T: Encode>(
+        &self,
+        timestamp_ns: impl Into<Timestamp>,
+        value: &T,
+    ) -> Result<()> {
+        let timestamp_ns = timestamp_ns.into().as_ns();
         let mut guard = self.topic.slot.lock().await;
         let slot = self.topic.open(&mut guard).await?;
         let result = self.topic.push_record(slot, timestamp_ns, value).await;
@@ -608,9 +612,8 @@ impl TopicState {
                 row.num_rows()
             )));
         }
-        let Some((timestamp_ns, _)) = timestamp_range(&row)? else {
-            return Ok(false);
-        };
+        let (timestamp_ns, _) = timestamp_range(&row)?
+            .ok_or_else(|| Error::invalid_argument("expected one record, got 0 rows"))?;
         self.admit(slot, timestamp_ns)?;
         let schema = row.schema();
         let reuse = slot.rows.as_mut().is_some_and(|rows| {
@@ -720,10 +723,7 @@ impl TopicState {
         };
         let (sent, reason) = match close {
             Close::Finish => (self.send_rows(open, false).await, None),
-            Close::Report(reason) => {
-                self.reporter.report(reason).await;
-                (Ok(()), Some(reason))
-            }
+            Close::Report(reason) => (Ok(()), Some(reason)),
             Close::Discard(reason) => {
                 *slot = None;
                 self.set_state(
@@ -744,11 +744,19 @@ impl TopicState {
             ),
         }
         self.start_closing(open.writer);
+        let report = reason.map(|reason| {
+            let reporter = self.reporter.clone();
+            let reason = reason.to_owned();
+            tokio::spawn(async move { reporter.report(&reason).await })
+        });
         let result = match self.closed().await {
             Ok(()) => sent,
             Err(error) if error.kind() == ErrorKind::Closed => sent.and(Err(error)),
             Err(error) => Err(error),
         };
+        if let Some(report) = report {
+            let _ = report.await;
+        }
         if let Err(error) = &result {
             self.set_state(
                 TopicWriterStatus::FinalizedWithError,
@@ -772,13 +780,17 @@ fn other_buffer() -> Error {
 
 fn timestamp_range(batch: &RecordBatch) -> Result<Option<(i64, i64)>> {
     let timestamps = batch
-        .column_by_name(TIMESTAMP)
+        .column_by_name(TIMESTAMP_COLUMN)
         .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
-        .ok_or_else(|| Error::schema(format!("batch must have a '{TIMESTAMP}' Int64 column")))?;
+        .ok_or_else(|| {
+            Error::schema(format!(
+                "batch must have a '{TIMESTAMP_COLUMN}' Int64 column"
+            ))
+        })?;
     if timestamps.null_count() > 0 {
         return Err(Error::new(
             ErrorKind::InvalidArgument,
-            format!("'{TIMESTAMP}' must not contain nulls"),
+            format!("'{TIMESTAMP_COLUMN}' must not contain nulls"),
         ));
     }
     let values = timestamps.values();
@@ -786,7 +798,7 @@ fn timestamp_range(batch: &RecordBatch) -> Result<Option<(i64, i64)>> {
         return Err(Error::new(
             ErrorKind::InvalidArgument,
             format!(
-                "'{TIMESTAMP}' must be non-decreasing: found a timestamp lower than the previous one"
+                "'{TIMESTAMP_COLUMN}' must be non-decreasing: found a timestamp lower than the previous one"
             ),
         ));
     }
@@ -798,7 +810,7 @@ fn check_follows(topic: &str, previous: i64, first: i64) -> Result<()> {
         return Err(Error::new(
             ErrorKind::InvalidArgument,
             format!(
-                "'{TIMESTAMP}' must be non-decreasing across pushes on topic '{topic}': got {first}, lower than the last pushed timestamp {previous}"
+                "'{TIMESTAMP_COLUMN}' must be non-decreasing across pushes on topic '{topic}': got {first}, lower than the last pushed timestamp {previous}"
             ),
         ));
     }
@@ -819,7 +831,7 @@ mod tests {
     fn offline_writer(on_error: TopicLevelErrorPolicy) -> TopicWriter {
         let connection = Connection::offline(1 << 20);
         let schema = Arc::new(Schema::new(vec![Field::new(
-            TIMESTAMP,
+            TIMESTAMP_COLUMN,
             DataType::Int64,
             false,
         )]));
@@ -1150,7 +1162,7 @@ mod tests {
 
     fn batch(timestamps: Vec<Option<i64>>) -> RecordBatch {
         let column: ArrayRef = Arc::new(Int64Array::from(timestamps));
-        RecordBatch::try_from_iter([(TIMESTAMP, column)]).unwrap()
+        RecordBatch::try_from_iter([(TIMESTAMP_COLUMN, column)]).unwrap()
     }
 
     fn kind(result: Result<impl std::fmt::Debug>) -> ErrorKind {
@@ -1266,7 +1278,8 @@ mod tests {
             vec![0u8; 1 << 21].as_slice(),
         ]));
         let row =
-            RecordBatch::try_from_iter([(TIMESTAMP, timestamps), ("payload", payload)]).unwrap();
+            RecordBatch::try_from_iter([(TIMESTAMP_COLUMN, timestamps), ("payload", payload)])
+                .unwrap();
         assert!(writer.push_row(row).await.is_err());
         assert_eq!(writer.dropped_record_count(), 0);
     }

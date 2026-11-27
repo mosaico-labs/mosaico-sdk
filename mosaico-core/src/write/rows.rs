@@ -6,14 +6,15 @@ use arrow_array::{ArrayRef, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
 use crate::error::{Error, Result};
+use crate::ontology::TIMESTAMP_COLUMN;
 use crate::ontology::{Encode, RecordBuilder};
-use crate::write::topic::{FlushPolicy, TIMESTAMP};
+use crate::write::topic::FlushPolicy;
 
 const CHUNK_BYTES: usize = 1 << 20;
 const TIMESTAMP_BYTES: usize = 8;
 
 pub fn record_schema<T: Encode>() -> SchemaRef {
-    let timestamp = Arc::new(Field::new(TIMESTAMP, DataType::Int64, false));
+    let timestamp = Arc::new(Field::new(TIMESTAMP_COLUMN, DataType::Int64, false));
     let fields: Vec<_> = std::iter::once(timestamp)
         .chain(T::fields().iter().cloned())
         .collect();
@@ -196,7 +197,7 @@ mod tests {
 
     fn row(timestamp_ns: i64) -> RecordBatch {
         let column: ArrayRef = Arc::new(Int64Array::from(vec![timestamp_ns]));
-        RecordBatch::try_from_iter([(TIMESTAMP, column)]).unwrap()
+        RecordBatch::try_from_iter([(TIMESTAMP_COLUMN, column)]).unwrap()
     }
 
     #[test]

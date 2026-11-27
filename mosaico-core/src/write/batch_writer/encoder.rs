@@ -164,6 +164,35 @@ mod tests {
     }
 
     #[test]
+    fn pieces_fit_limit() {
+        let limit = 1 << 20;
+        let rows = 200_000;
+        let batch = RecordBatch::try_from_iter([
+            (
+                "timestamp_ns",
+                Arc::new(arrow_array::Int64Array::from_iter_values(0..rows)) as ArrayRef,
+            ),
+            (
+                "value",
+                Arc::new(Float64Array::from_iter_values((0..rows).map(|v| v as f64))) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let encoder = Encoder {
+            schema: batch.schema(),
+            options: IpcWriteOptions::default(),
+            limit,
+        };
+        let pieces = split(batch, crate::comm::budget::target(limit));
+        assert!(pieces.len() > 1);
+        for (piece, _) in pieces {
+            let (flights, dropped) = encoder.encode_all(vec![piece]).unwrap();
+            assert_eq!(flights.len(), 1);
+            assert_eq!(dropped, Dropped::default());
+        }
+    }
+
+    #[test]
     fn estimate_slice() {
         let rows = 1000;
         let values = Float64Array::from_iter_values((0..rows * 9).map(|v| v as f64));

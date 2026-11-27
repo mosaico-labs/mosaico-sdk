@@ -69,7 +69,7 @@ fn binary_column<'a>(
     Ok(BinaryArray::from_iter(values))
 }
 
-pub const THREADS_VARIABLE: &str = "MOSAICO_PNG_THREADS";
+const THREADS_VARIABLE: &str = "MOSAICO_PNG_THREADS";
 
 fn threads() -> Result<usize> {
     let Ok(value) = std::env::var(THREADS_VARIABLE) else {
@@ -103,9 +103,7 @@ fn pool() -> Result<&'static ThreadPool> {
             .thread_name(|i| format!("mosaico-png-{i}"))
             .num_threads(threads()?)
             .build()
-            .map_err(|e| {
-                Error::invalid_argument(format!("cannot start the encoding threads: {e}"))
-            })?;
+            .map_err(|e| Error::invalid_argument(format!("cannot start the PNG threads: {e}")))?;
         let new = Box::into_raw(Box::new(ProcessPool { pid, pool }));
         match CURRENT.compare_exchange(current, new, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => return Ok(unsafe { &(*new).pool }),

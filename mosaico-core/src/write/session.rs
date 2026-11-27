@@ -7,6 +7,7 @@ use crate::comm::connection::Connection;
 use crate::comm::proto;
 use crate::error::{Error, ErrorKind, Result};
 use crate::locator::{new_sequence_name, sequence_name};
+use crate::metadata::UserMetadata;
 use crate::ontology::Format;
 use crate::scope::{Scope, Token};
 use crate::write::topic::TopicState;
@@ -25,6 +26,11 @@ impl Interrupter {
 
     pub fn interrupted(&self) -> bool {
         self.0.load(Ordering::Relaxed)
+    }
+
+    #[doc(hidden)]
+    pub fn id(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
     }
 }
 
@@ -63,13 +69,13 @@ impl Session {
     pub(crate) async fn create(
         connection: &Connection,
         sequence: &str,
-        metadata: Option<Vec<u8>>,
+        metadata: Option<&UserMetadata>,
         policy: SessionLevelErrorPolicy,
     ) -> Result<Self> {
         let sequence = new_sequence_name(sequence)?.to_owned();
         let request = proto::requests::SequenceCreate {
             locator: sequence.clone(),
-            user_metadata: metadata.unwrap_or_default(),
+            user_metadata: metadata.map(UserMetadata::to_wire).unwrap_or_default(),
         };
         connection
             .action_empty(ActionKind::SequenceCreate, &request)
@@ -78,10 +84,13 @@ impl Session {
             Ok(session) => Ok(session),
             Err(error) => {
                 let request = proto::requests::ResourceLocator { locator: sequence };
-                let _ = connection
+                match connection
                     .action_empty(ActionKind::SequenceDelete, &request)
-                    .await;
-                Err(error)
+                    .await
+                {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(error.left_open_by(&cleanup)),
+                }
             }
         }
     }
@@ -145,7 +154,7 @@ impl Session {
         name: &str,
         ontology_tag: &str,
         format: Format,
-        metadata: Option<Vec<u8>>,
+        metadata: Option<&UserMetadata>,
     ) -> Result<CreatedTopic> {
         let locator = format!("{}{name}", self.sequence);
         let request = proto::requests::TopicCreate {
@@ -153,7 +162,7 @@ impl Session {
             session_uuid: self.uuid.clone(),
             serialization_format: format.to_proto(),
             ontology_tag: ontology_tag.to_owned(),
-            user_metadata: metadata.unwrap_or_default(),
+            user_metadata: metadata.map(UserMetadata::to_wire).unwrap_or_default(),
         };
         let created: proto::responses::ResourceUuid = self
             .connection

@@ -31,6 +31,8 @@ pub(crate) use self::schema::Conversion;
 use self::schema::{plain_schema, relabel, shape, shape_of, unmasked_nulls};
 
 const IN_FLIGHT: usize = 2;
+const PIECE_COST: usize = 256;
+const COLUMN_COST: usize = 128;
 
 enum Input {
     Batch(Queued),
@@ -60,6 +62,10 @@ struct Piece {
 }
 
 impl Piece {
+    fn cost(&self) -> usize {
+        self.bytes + PIECE_COST + COLUMN_COST * self.batch.num_columns()
+    }
+
     fn queued(self, permit: Permits) -> Queued {
         Queued {
             batch: self.batch,
@@ -141,7 +147,7 @@ impl BatchWriter {
         let encode = encode_loop(receiver, header, pending, encoding, Some(pressure));
         let ended = Arc::new(AtomicBool::new(false));
         let upload = upload(
-            connection.clone(),
+            connection.writer(),
             Outgoing {
                 frames: outgoing,
                 pressure: Some(connection.write_budget().pressure()),
@@ -230,7 +236,7 @@ impl BatchWriter {
                 urgent,
             });
         if let Some(first) = pieces.next() {
-            let permit = self.permit(first.bytes).await?;
+            let permit = self.permit(first.cost()).await?;
             self.hand_over(first, permit).await?;
         }
         self.unsent.extend(pieces);
@@ -239,8 +245,8 @@ impl BatchWriter {
     }
 
     pub(crate) async fn drain(&mut self) -> Result<()> {
-        while let Some(bytes) = self.unsent.front().map(|piece| piece.bytes) {
-            let permit = self.permit(bytes).await?;
+        while let Some(cost) = self.unsent.front().map(Piece::cost) {
+            let permit = self.permit(cost).await?;
             let Some(piece) = self.unsent.pop_front() else {
                 break;
             };
@@ -249,11 +255,11 @@ impl BatchWriter {
         Ok(())
     }
 
-    async fn permit(&mut self, bytes: usize) -> Result<Permits> {
+    async fn permit(&mut self, cost: usize) -> Result<Permits> {
         if self.interrupter.interrupted() {
             return Err(interrupted_error());
         }
-        let Some(permit) = self.queue.acquire(bytes).await else {
+        let Some(permit) = self.queue.acquire(cost).await else {
             return Err(self.stopped().await);
         };
         if self.interrupter.interrupted() {
@@ -840,5 +846,28 @@ mod tests {
         let _held = queue.acquire(99).await.unwrap();
         let large = tokio::time::timeout(Duration::from_secs(1), queue.acquire(10_000)).await;
         assert!(large.is_ok_and(|permit| permit.is_some()));
+    }
+
+    #[test]
+    fn tiny_piece_cost() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp_ns", DataType::Int64, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(arrow_array::Float64Array::from(vec![1.0])),
+            ],
+        )
+        .unwrap();
+        let piece = Piece {
+            bytes: estimate(&batch),
+            batch,
+            since: None,
+            urgent: false,
+        };
+        assert_eq!(piece.cost(), 16 + PIECE_COST + 2 * COLUMN_COST);
     }
 }
