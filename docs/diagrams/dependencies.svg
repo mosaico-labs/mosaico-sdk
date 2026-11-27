@@ -115,15 +115,15 @@
           <text class="t1" x="652" y="274">Session</text><text class="t2" x="652" y="294">lifecycle</text></g>
         <g class="box" data-k="twriter" tabindex="0" role="button" aria-label="TopicWriter"><rect x="820" y="250" width="140" height="58" rx="8"/>
           <text class="t1" x="832" y="274">TopicWriter</text><text class="t2" x="832" y="294">builder</text></g>
-        <g class="box" data-k="multi" tabindex="0" role="button" aria-label="MultiReader"><rect x="330" y="370" width="180" height="58" rx="8"/>
-          <text class="t1" x="342" y="394">MultiReader</text><text class="t2" x="342" y="414">merge · concat</text></g>
+        <g class="box" data-k="multi" tabindex="0" role="button" aria-label="MergeReader"><rect x="330" y="370" width="180" height="58" rx="8"/>
+          <text class="t1" x="342" y="394">MergeReader</text><text class="t2" x="342" y="414">k-way merge</text></g>
         <g class="box" data-k="sink" tabindex="0" role="button" aria-label="BatchWriter"><rect x="720" y="370" width="180" height="58" rx="8"/>
           <text class="t1" x="732" y="394">BatchWriter</text><text class="t2" x="732" y="414">one do_put</text></g>
         <g class="box" data-k="stream" tabindex="0" role="button" aria-label="BatchReader"><rect x="80" y="490" width="180" height="58" rx="8"/>
           <text class="t1" x="92" y="514">BatchReader</text><text class="t2" x="92" y="534">one do_get</text></g>
         <g class="box" data-k="conn" tabindex="0" role="button" aria-label="Connection"><rect x="20" y="590" width="960" height="46" rx="8"/>
           <text class="t1" x="36" y="610">Connection</text>
-          <text class="t2" x="36" y="627">one per MosaicoClient · cloned into every block that calls mosaicod</text></g>
+          <text class="t2" x="36" y="627">one per MosaicoClient, plus extra connections by window size and stream count · cloned into every block that calls mosaicod</text></g>
 
         <!-- labels -->
         <text class="dl" x="782" y="18" text-anchor="middle">connect()</text>
@@ -136,9 +136,9 @@
         <text class="dl" x="629" y="152" text-anchor="middle">update()</text>
         <text class="dl" x="198" y="222">get_*_streamer()</text>
         <text class="dl" x="438" y="222">get_data_streamer()</text>
-        <text class="dl" x="408" y="342">merge · concat</text>
+        <text class="dl" x="408" y="342">K topics</text>
         <text class="dl" x="208" y="400">one topic</text>
-        <text class="dl" x="340" y="512" text-anchor="middle">×K topics · ×N ranges</text>
+        <text class="dl" x="340" y="512" text-anchor="middle">×K · one per topic</text>
         <text class="dl" x="723" y="222">owns</text>
         <text class="dl" x="882" y="222" text-anchor="end">topic_create()</text>
         <text class="dl" x="888" y="342">batches</text>

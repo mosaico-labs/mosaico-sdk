@@ -11,8 +11,8 @@ use arrow_array::{
 use arrow_ipc::reader::FileReader;
 use arrow_select::concat::concat_batches;
 use mosaico_core::{
-    ConnectOptions, Encode, Format, MosaicoClient, Ontology, SessionLevelErrorPolicy, TopicHandler,
-    TopicLevelErrorPolicy,
+    ConnectOptions, Encode, Format, MosaicoClient, Ontology, SessionLevelErrorPolicy,
+    TimestampRange, TopicHandler, TopicLevelErrorPolicy,
 };
 use mosaico_ontology::{
     CompressedImage, Image, Imu, Pixels, decode_png, decode_png_batch, decode_png_batches,
@@ -25,8 +25,6 @@ const MULTI: [(&str, usize, &str); 4] = [
     ("image_noise_720p", 200, "1"),
     ("jpeg_720p", 1_600, "8"),
 ];
-
-type Range = (Option<i64>, Option<i64>);
 
 fn kind(name: &str) -> Result<(&'static str, &'static str, Format), Box<dyn Error>> {
     Ok(match name {
@@ -84,14 +82,14 @@ fn slices(table: &RecordBatch, spec: &str) -> Result<Vec<RecordBatch>, Box<dyn E
     Ok(out)
 }
 
-fn windows(path: &str) -> Result<Vec<Range>, Box<dyn Error>> {
+fn windows(path: &str) -> Result<Vec<TimestampRange>, Box<dyn Error>> {
     let values = std::fs::read_to_string(path)?
         .split_whitespace()
         .map(str::parse)
         .collect::<Result<Vec<i64>, _>>()?;
     Ok(values
         .chunks(2)
-        .map(|pair| (Some(pair[0]), Some(pair[1])))
+        .map(|pair| (pair[0]..pair[1]).into())
         .collect())
 }
 
@@ -328,10 +326,10 @@ async fn write_multi(variant: &str) -> Result<String, Box<dyn Error>> {
 
 async fn rows<T: Ontology>(
     handler: &TopicHandler,
-    (start, end): Range,
+    range: TimestampRange,
     touch: impl Fn(&T::View<'_>) -> mosaico_core::Result<f64>,
 ) -> Result<(u64, f64), Box<dyn Error>> {
-    let mut streamer = handler.get_data_streamer::<T>(start, end).await?;
+    let mut streamer = handler.get_data_streamer::<T>(range).await?;
     let (mut count, mut acc) = (0u64, 0.0);
     while let Some(msg) = streamer.next().await? {
         acc += touch(&msg.data)?;
@@ -342,9 +340,9 @@ async fn rows<T: Ontology>(
 
 async fn batches(
     handler: &TopicHandler,
-    (start, end): Range,
+    range: TimestampRange,
 ) -> Result<(u64, f64), Box<dyn Error>> {
-    let mut streamer = handler.get_batch_streamer(start, end).await?;
+    let mut streamer = handler.get_batch_streamer(range).await?;
     let mut count = 0u64;
     while let Some(batch) = streamer.next_batch().await? {
         count += batch.num_rows() as u64;
@@ -354,10 +352,10 @@ async fn batches(
 
 async fn decoded(
     handler: &TopicHandler,
-    (start, end): Range,
+    range: TimestampRange,
     per_batch: bool,
 ) -> Result<(u64, f64), Box<dyn Error>> {
-    let mut streamer = handler.get_batch_streamer(start, end).await?;
+    let mut streamer = handler.get_batch_streamer(range).await?;
     let (mut count, mut bytes) = (0u64, 0usize);
     while let Some(batch) = streamer.next_batch().await? {
         count += batch.num_rows() as u64;
@@ -386,8 +384,11 @@ async fn read(
 ) -> Result<String, Box<dyn Error>> {
     let ranges = match bounds.first() {
         Some(first) if first.starts_with('@') => windows(&first[1..])?,
-        Some(first) => vec![(Some(first.parse()?), Some(bounds[1].parse()?))],
-        None => vec![(None, None)],
+        Some(first) => {
+            let (start, end): (i64, i64) = (first.parse()?, bounds[1].parse()?);
+            vec![(start..end).into()]
+        }
+        None => vec![TimestampRange::ALL],
     };
     let (_, topic, _) = kind(kind_name)?;
     let client = connect().await?;
@@ -409,7 +410,7 @@ async fn read(
             ("decode-rows", _) => decoded(&handler, range, false).await?,
             ("decode-batches", _) => decoded(&handler, range, true).await?,
             ("decode-table", _) => {
-                let mut streamer = handler.get_batch_streamer(range.0, range.1).await?;
+                let mut streamer = handler.get_batch_streamer(range).await?;
                 let mut all = Vec::new();
                 while let Some(batch) = streamer.next_batch().await? {
                     all.push(batch);

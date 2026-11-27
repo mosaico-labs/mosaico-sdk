@@ -1,6 +1,7 @@
 import hashlib
 import io
 import json
+import os
 import random
 import statistics
 import subprocess
@@ -219,7 +220,7 @@ def main() -> None:
     expected_windows = write_specs()
     order = random.Random(7)
     results = []
-    with m.MosaicoClient.connect("localhost", 6728) as client:
+    with m.MosaicoClient.connect("localhost", int(os.environ.get("MOSAICO_PORT", "6728"))) as client:
         if only in ("all", "write"):
             for kind, rows, spec, clients in WRITES:
                 times: dict[str, list[float]] = {c: [] for c in clients}
@@ -294,7 +295,8 @@ def main() -> None:
                         }
                     results.append(row)
                     print(json.dumps(row), flush=True)
-    (OUT / f"results-{only}.json").write_text(json.dumps(results, indent=1))
+    tag = os.environ.get("BENCH_TAG", "")
+    (OUT / f"results-{only}{tag}.json").write_text(json.dumps(results, indent=1))
 
 
 if __name__ == "__main__":

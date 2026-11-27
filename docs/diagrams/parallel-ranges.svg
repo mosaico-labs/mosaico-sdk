@@ -92,7 +92,7 @@
         <text class="sl" x="268" y="114">binding</text>
         <path class="s" d="M740 98 V122" marker-end="url(#ah-s)"/>
         <path class="s" d="M500 414 V464" marker-start="url(#ah-s)" marker-end="url(#ah-s)"/>
-        <text class="sl" x="508" y="446">Arrow Flight · one connection</text>
+        <text class="sl" x="508" y="446">Arrow Flight · main + extra connections</text>
 
         <!-- flow edges -->
         <path class="e t" d="M250 206 V366"/>
@@ -117,10 +117,10 @@
         <!-- boxes -->
         <g class="box" data-k="py" tabindex="0" role="button" aria-label="Python SDK"><rect x="40" y="40" width="440" height="58" rx="8"/>
           <text class="t1" x="56" y="64">Python SDK</text>
-          <text class="t2" x="56" y="84">generated ontologies and views · exceptions · pandas · ml</text></g>
+          <text class="t2" x="56" y="84">exceptions · pandas · planned: codegen views · ml</text></g>
         <g class="box" data-k="rs" tabindex="0" role="button" aria-label="Rust SDK"><rect x="520" y="40" width="440" height="58" rx="8"/>
           <text class="t1" x="536" y="64">Rust SDK</text>
-          <text class="t2" x="536" y="84">async + blocking API · Result · generated ontologies</text></g>
+          <text class="t2" x="536" y="84">async API · Result · planned: blocking API · codegen</text></g>
 
         <g class="box o" data-k="client" tabindex="0" role="button" aria-label="MosaicoClient"><rect x="40" y="148" width="160" height="58" rx="8"/>
           <text class="t1" x="52" y="172">MosaicoClient</text><text class="t2" x="52" y="192">connect · query</text></g>
@@ -135,8 +135,8 @@
 
         <g class="box t m p" data-k="stream" tabindex="0" role="button" aria-label="BatchReader"><rect x="260" y="258" width="160" height="60" rx="8"/>
           <text class="t1" x="272" y="282">BatchReader</text><text class="t2" x="272" y="302">background decode</text></g>
-        <g class="box m p" data-k="multi" tabindex="0" role="button" aria-label="MultiReader"><rect x="470" y="258" width="150" height="60" rx="8"/>
-          <text class="t1" x="482" y="282">MultiReader</text><text class="t2" x="482" y="302">merge · concat</text></g>
+        <g class="box m p" data-k="multi" tabindex="0" role="button" aria-label="ConcatReader"><rect x="470" y="258" width="150" height="60" rx="8"/>
+          <text class="t1" x="482" y="282">ConcatReader</text><text class="t2" x="482" y="302">option · not built</text></g>
         <g class="box w" data-k="session" tabindex="0" role="button" aria-label="Session"><rect x="700" y="258" width="120" height="60" rx="8"/>
           <text class="t1" x="712" y="282">Session</text><text class="t2" x="712" y="302">create · update</text></g>
         <g class="box w" data-k="sink" tabindex="0" role="button" aria-label="BatchWriter"><rect x="840" y="258" width="120" height="60" rx="8"/>
@@ -144,21 +144,21 @@
 
         <g class="box t m p w o" data-k="conn" tabindex="0" role="button" aria-label="Connection"><rect x="40" y="368" width="920" height="46" rx="8"/>
           <text class="t1" x="56" y="388">Connection</text>
-          <text class="t2" x="56" y="405">connect · info · limits · get_flight_info · do_get · do_put · do_action · list_flights · TLS · api_key · compression · errors</text></g>
+          <text class="t2" x="56" y="405">connect · info · limits · get_flight_info · get_schema · do_get · do_put · do_action · list_flights · TLS · api_key · compression</text></g>
 
         <g class="box t m p w o" data-k="server" tabindex="0" role="button" aria-label="mosaicod"><rect x="40" y="466" width="920" height="54" rx="8"/>
           <text class="t1" x="56" y="488">mosaicod</text>
-          <text class="t2" x="56" y="507">get_flight_info · do_get · do_put · do_action · list_flights</text></g>
+          <text class="t2" x="56" y="507">get_flight_info · get_schema · do_get · do_put · do_action · list_flights</text></g>
 
         <!-- edge labels -->
         <text class="el t" x="244" y="296" text-anchor="end">get_flight_info · on open</text>
         <text class="el t" x="346" y="236">ticket</text>
         <text class="el t m p" x="346" y="352">do_get</text>
         <text class="el t" x="406" y="236">batches</text>
-        <text class="el m" x="461" y="352">get_flight_info · sequence</text>
-        <text class="el m" x="551" y="236">K tickets</text>
+        <text class="el m" x="461" y="352">get_flight_info · sequence (+K if ranged)</text>
+        <text class="el m" x="539" y="236" text-anchor="end">K streams</text>
         <text class="el m" x="445" y="272" text-anchor="middle">×K</text>
-        <text class="el m" x="606" y="236">slices + order</text>
+        <text class="el m" x="606" y="236">batches + order</text>
         <text class="el p" x="435" y="235" text-anchor="middle">N tickets</text>
         <text class="el p" x="445" y="272" text-anchor="middle">×N</text>
         <text class="el p" x="505" y="219" text-anchor="middle">in order</text>

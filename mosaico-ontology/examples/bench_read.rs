@@ -57,7 +57,7 @@ async fn read_once(
     let started = Instant::now();
     let seq = client.sequence_handler(sequence).await?;
     let topic = seq.topic_handler(TOPIC)?;
-    let mut streamer = topic.get_data_streamer::<Imu>(None, None).await?;
+    let mut streamer = topic.get_data_streamer::<Imu>(..).await?;
     let mut count = 0u64;
     let mut total = 0.0;
     while let Some(msg) = streamer.next().await? {
