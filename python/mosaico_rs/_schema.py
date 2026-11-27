@@ -6,11 +6,20 @@ from dataclasses import dataclass
 from typing import Any, get_args
 
 import pyarrow as pa
-from mosaicolabs import IMU, Message, Serializable
+from mosaicolabs import IMU, CompressedImage, Image, Message, Serializable
 from pydantic import BaseModel
 
 from ._errors import InvalidArgumentError
-from ._views import Columns, IMUView, imu_model
+from ._views import (
+    Columns,
+    CompressedImageView,
+    ImageView,
+    IMUView,
+    compressed_image_model,
+    image_model,
+    imu_model,
+    validated,
+)
 
 _INT64_MIN = -(2**63)
 _INT64_MAX = 2**63 - 1
@@ -73,7 +82,12 @@ def _model(annotation: Any) -> type[BaseModel] | None:
     return None
 
 
-SPECS: dict[type[Serializable], OntologySpec] = {IMU: _spec(IMU, IMUView, imu_model)}
+SPECS: dict[type[Serializable], OntologySpec] = {
+    IMU: _spec(IMU, IMUView, validated(IMU, imu_model)),
+    Image: _spec(Image, ImageView, validated(Image, image_model)),
+    CompressedImage: _spec(CompressedImage, CompressedImageView, validated(CompressedImage, compressed_image_model)),
+}
+SPECS_BY_TAG: dict[str, OntologySpec] = {spec.tag: spec for spec in SPECS.values()}
 
 
 _VIEWS = {pa.string_view(): pa.string(), pa.binary_view(): pa.binary()}

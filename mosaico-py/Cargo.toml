@@ -16,6 +16,7 @@ mosaico-ontology = { path = "../mosaico-ontology", features = ["png"] }
 arrow-array = { workspace = true, features = ["ffi"] }
 arrow-buffer.workspace = true
 arrow-schema = { workspace = true, features = ["ffi"] }
+arrow-select.workspace = true
 arrow-data = { workspace = true, features = ["ffi"] }
 pyo3.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"] }

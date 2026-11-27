@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex as SchemaLock, PoisonError};
 
 use mosaico_core::{
     Encode, Error, FlushPolicy, Format, Interrupter, TopicLevelErrorPolicy, TopicWriterStatus,
+    UserMetadata,
 };
 use pyo3::exceptions::PyBaseException;
 use pyo3::prelude::*;
@@ -13,11 +14,10 @@ use crate::errors::{
     MosaicoError, StreamClosedError, invalid, parse_seconds, sequence_error, to_py,
 };
 use crate::record;
-use crate::runtime::{Closing, ProcessBound, run, run_now, wait, wait_closing};
+use crate::runtime::{Closing, ProcessBound, enter, run, run_now, wait, wait_closing};
 
 #[pyclass(frozen, module = "mosaico_rs._core")]
 pub(crate) struct SequenceWriter {
-    name: String,
     session_locator: String,
     interrupter: Interrupter,
     left_open: AtomicBool,
@@ -27,7 +27,6 @@ pub(crate) struct SequenceWriter {
 impl SequenceWriter {
     pub(crate) fn new(writer: mosaico_core::SequenceWriter) -> Self {
         Self {
-            name: writer.name().to_owned(),
             session_locator: writer.session_locator().to_owned(),
             interrupter: writer.interrupter(),
             left_open: AtomicBool::new(false),
@@ -114,11 +113,6 @@ fn count(name: &str, value: Option<i64>) -> PyResult<Option<usize>> {
 #[pymethods]
 impl SequenceWriter {
     #[getter]
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    #[getter]
     fn session_locator(&self) -> &str {
         &self.session_locator
     }
@@ -137,7 +131,7 @@ impl SequenceWriter {
         ontology_tag: &str,
         format: &str,
         schema: &Bound<'_, PyAny>,
-        metadata: Option<Vec<u8>>,
+        metadata: Option<&str>,
         on_error: &str,
     ) -> PyResult<TopicWriter> {
         let format = match format {
@@ -157,6 +151,8 @@ impl SequenceWriter {
             }
         };
         let schema = import_schema(schema)?;
+        let metadata = user_metadata(metadata)?;
+        let _entered = enter(self.interrupter.id())?;
         let inner = self.inner.get()?;
         let created = wait_closing(
             py,
@@ -164,7 +160,14 @@ impl SequenceWriter {
                 match inner.lock().await.as_mut() {
                     Some(writer) => Some(
                         writer
-                            .topic_create(name, ontology_tag, format, schema, metadata, on_error)
+                            .topic_create(
+                                name,
+                                ontology_tag,
+                                format,
+                                schema,
+                                metadata.as_ref(),
+                                on_error,
+                            )
                             .await,
                     ),
                     None => None,
@@ -183,6 +186,7 @@ impl SequenceWriter {
     }
 
     fn finish(&self, py: Python<'_>) -> PyResult<Option<Py<PyBaseException>>> {
+        let _entered = enter(self.interrupter.id())?;
         let inner = self.inner.get()?;
         let closing = wait_closing(
             py,
@@ -202,6 +206,7 @@ impl SequenceWriter {
 
     #[pyo3(signature = (reason, interrupted = false))]
     fn abort(&self, py: Python<'_>, reason: &str, interrupted: bool) -> PyResult<()> {
+        let _entered = enter(self.interrupter.id())?;
         if interrupted {
             self.interrupter.interrupt();
         }
@@ -286,6 +291,7 @@ impl TopicWriter {
 
     fn push_batch(&self, py: Python<'_>, batch: &Bound<'_, PyAny>) -> PyResult<()> {
         let writer = self.0.get()?;
+        let _entered = enter(self.2.id())?;
         let batch = self.import(batch);
         run(py, async {
             match batch.and_then(Imported::owned) {
@@ -297,6 +303,7 @@ impl TopicWriter {
 
     fn push_row(&self, py: Python<'_>, row: &Bound<'_, PyAny>) -> PyResult<()> {
         let writer = self.0.get()?;
+        let _entered = enter(self.2.id())?;
         let row = self.import(row);
         run_now(py, async {
             match row.and_then(Imported::owned) {
@@ -314,6 +321,7 @@ impl TopicWriter {
         data: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         let writer = self.0.get()?;
+        let _entered = enter(self.2.id())?;
         match kind {
             "imu" => push_value(py, writer, timestamp_ns, record::imu(data)),
             "image" => push_value(py, writer, timestamp_ns, record::image(data)),
@@ -326,6 +334,7 @@ impl TopicWriter {
 
     fn handle_error(&self, py: Python<'_>, reason: &str) -> PyResult<bool> {
         let writer = self.0.get()?;
+        let _entered = enter(self.2.id())?;
         match wait_closing(py, writer.handle_error(reason), &self.2)? {
             Closing::Done(result) => result.map_err(to_py),
             Closing::Interrupted(Err(error), signal) => Err(interrupted(py, signal, error, to_py)),
@@ -336,6 +345,7 @@ impl TopicWriter {
     #[pyo3(signature = (error = None))]
     fn finalize(&self, py: Python<'_>, error: Option<&str>) -> PyResult<()> {
         let writer = self.0.get()?;
+        let _entered = enter(self.2.id())?;
         match wait_closing(py, writer.finalize(error), &self.2)? {
             Closing::Done(result) => result.map_err(to_py),
             Closing::Interrupted(Err(error), signal) => Err(interrupted(py, signal, error, to_py)),
@@ -345,12 +355,14 @@ impl TopicWriter {
 
     fn reject(&self, py: Python<'_>, message: &str) -> PyResult<Py<PyBaseException>> {
         let writer = self.0.get()?;
+        let _entered = enter(self.2.id())?;
         let error = wait(py, writer.reject(Error::invalid_argument(message)))?;
         Ok(to_py(error).into_value(py))
     }
 
     fn flush(&self, py: Python<'_>) -> PyResult<()> {
         let writer = self.0.get()?;
+        let _entered = enter(self.2.id())?;
         run(py, writer.flush())
     }
 
@@ -367,6 +379,7 @@ impl TopicWriter {
         policy.max_rows = count("max_rows", max_rows)?;
         policy.max_age = max_age.map(|s| parse_seconds("max_age", s)).transpose()?;
         let writer = self.0.get()?;
+        let _entered = enter(self.2.id())?;
         run(py, writer.set_flush_policy(policy))
     }
 }
@@ -374,4 +387,13 @@ impl TopicWriter {
 #[pyfunction]
 pub(crate) fn topic_name(name: &str) -> String {
     mosaico_core::topic_name(name)
+}
+
+#[pyfunction]
+pub(crate) fn check_user_metadata(text: &str) -> PyResult<()> {
+    UserMetadata::from_json(text).map(drop).map_err(to_py)
+}
+
+pub(crate) fn user_metadata(text: Option<&str>) -> PyResult<Option<UserMetadata>> {
+    text.map(UserMetadata::from_json).transpose().map_err(to_py)
 }

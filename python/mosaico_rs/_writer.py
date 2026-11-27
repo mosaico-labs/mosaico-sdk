@@ -33,12 +33,17 @@ _RECORD_KINDS: dict[type[Serializable], str] = {
 _log = logging.getLogger(__name__)
 
 
-def _metadata(metadata: dict[str, Any] | None) -> bytes | None:
+def _metadata(metadata: dict[str, Any] | None) -> str | None:
     if metadata is None:
         return None
     if not isinstance(metadata, dict):
         raise InvalidArgumentError(f"metadata must be a dict, not {type(metadata).__name__}")
-    return json.dumps(metadata).encode("utf-8")
+    try:
+        text = json.dumps(metadata, allow_nan=False)
+    except ValueError as e:
+        raise InvalidArgumentError(f"metadata cannot be converted to JSON: {e}") from None
+    _core.check_user_metadata(text)
+    return text
 
 
 def _timestamps(value: Any) -> pa.Array:

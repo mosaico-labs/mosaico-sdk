@@ -1,10 +1,14 @@
-use mosaico_core::{Compression, ConnectOptions, Notification, SessionLevelErrorPolicy};
+use mosaico_core::{
+    Compression, ConnectOptions, Notification, PageStart, SequenceCursor, SequenceOrder,
+    SessionLevelErrorPolicy,
+};
 use pyo3::prelude::*;
+use pyo3::types::PyBytes;
 
-use crate::errors::{invalid, parse_seconds, sequence_error};
+use crate::errors::{invalid, parse_seconds, sequence_error, to_py};
 use crate::read::{SequenceHandler, TopicHandler};
 use crate::runtime::{ProcessBound, run, wait};
-use crate::write::SequenceWriter;
+use crate::write::{SequenceWriter, user_metadata};
 
 #[pyclass(frozen, module = "mosaico_rs._core")]
 pub(crate) struct Client(ProcessBound<mosaico_core::MosaicoClient>);
@@ -12,7 +16,7 @@ pub(crate) struct Client(ProcessBound<mosaico_core::MosaicoClient>);
 #[pymethods]
 impl Client {
     #[staticmethod]
-    #[pyo3(signature = (host, port, timeout, tls = false, tls_cert = None, api_key = None, compression = None))]
+    #[pyo3(signature = (host, port, timeout, tls = false, tls_cert = None, api_key = None, compression = None, read_window_size = None, max_streams_per_connection = None))]
     #[allow(clippy::too_many_arguments)]
     fn connect(
         py: Python<'_>,
@@ -23,6 +27,8 @@ impl Client {
         tls_cert: Option<&[u8]>,
         api_key: Option<String>,
         compression: Option<&str>,
+        read_window_size: Option<i64>,
+        max_streams_per_connection: Option<i64>,
     ) -> PyResult<Self> {
         let port = u16::try_from(port)
             .ok()
@@ -45,18 +51,48 @@ impl Client {
         options.tls_cert = tls_cert.map(<[u8]>::to_vec);
         options.api_key = api_key;
         options.compression = compression;
+        options.read_window_size = read_window_size
+            .map(|bytes| {
+                u32::try_from(bytes).map_err(|_| {
+                    invalid(format!(
+                        "read_window_size must be between 64 KiB and 1 GiB, not {bytes} bytes"
+                    ))
+                })
+            })
+            .transpose()?;
+        options.max_streams_per_connection = max_streams_per_connection
+            .map(|streams| {
+                u32::try_from(streams).map_err(|_| {
+                    invalid(format!(
+                        "max_streams_per_connection must be between 1 and {}, not {streams}",
+                        u32::MAX
+                    ))
+                })
+            })
+            .transpose()?;
         let client = run(py, mosaico_core::MosaicoClient::connect(options))?;
         Ok(Self(ProcessBound::new(client)))
     }
 
-    #[getter]
-    fn server_version(&self) -> PyResult<String> {
-        Ok(self.0.get()?.server_info().version.clone())
+    #[allow(clippy::type_complexity)]
+    fn info(&self) -> PyResult<(String, (u64, u64, u64, Option<String>), (u64, u64, u64))> {
+        let info = self.0.get()?.info();
+        let semver = &info.semver;
+        let config = &info.config;
+        Ok((
+            info.version.clone(),
+            (semver.major, semver.minor, semver.patch, semver.pre.clone()),
+            (
+                config.grpc_max_decode_message_size,
+                config.grpc_max_encode_message_size,
+                config.grpc_target_encode_message_size,
+            ),
+        ))
     }
 
     #[getter]
     fn max_batch_size_bytes(&self) -> PyResult<u64> {
-        Ok(self.0.get()?.server_info().max_batch_size_bytes())
+        Ok(self.0.get()?.info().max_batch_size_bytes())
     }
 
     fn close(&self) -> PyResult<()> {
@@ -81,13 +117,14 @@ impl Client {
         &self,
         py: Python<'_>,
         name: &str,
-        metadata: Option<Vec<u8>>,
+        metadata: Option<&str>,
         on_error: &str,
     ) -> PyResult<SequenceWriter> {
+        let metadata = user_metadata(metadata)?;
         let client = self.0.get()?;
         let policy = session_policy(on_error)?;
-        let writer =
-            wait(py, client.sequence_create(name, metadata, policy))?.map_err(sequence_error)?;
+        let writer = wait(py, client.sequence_create(name, metadata.as_ref(), policy))?
+            .map_err(sequence_error)?;
         Ok(SequenceWriter::new(writer))
     }
 
@@ -106,6 +143,38 @@ impl Client {
     fn list_sequences(&self, py: Python<'_>) -> PyResult<Vec<String>> {
         let client = self.0.get()?;
         run(py, client.list_sequences())
+    }
+
+    #[pyo3(signature = (limit, cursor, order_by))]
+    fn list_sequences_page<'py>(
+        &self,
+        py: Python<'py>,
+        limit: u32,
+        cursor: Option<&[u8]>,
+        order_by: Option<&str>,
+    ) -> PyResult<(Vec<String>, Option<Bound<'py, PyBytes>>)> {
+        let start = match (cursor, order_by) {
+            (Some(cursor), None) => SequenceCursor::from_bytes(cursor).map_err(to_py)?.into(),
+            (None, Some("created_at")) => PageStart::First(SequenceOrder::CreatedAt),
+            (None, Some("name")) => PageStart::First(SequenceOrder::Name),
+            (None, None) => PageStart::default(),
+            (Some(_), Some(_)) => {
+                return Err(invalid(
+                    "order_by can't be set with a cursor, which carries its order",
+                ));
+            }
+            (None, Some(other)) => {
+                return Err(invalid(format!(
+                    "order_by must be 'created_at' or 'name', not '{other}'"
+                )));
+            }
+        };
+        let client = self.0.get()?;
+        let page = run(py, client.list_sequences_page(limit, start))?;
+        let next_cursor = page
+            .next_cursor
+            .map(|cursor| PyBytes::new(py, cursor.as_bytes()));
+        Ok((page.names, next_cursor))
     }
 
     fn sequence_delete(&self, py: Python<'_>, name: &str) -> PyResult<()> {

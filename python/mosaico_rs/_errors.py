@@ -10,7 +10,7 @@ class SequenceNotFoundError(MosaicoError):
     pass
 
 
-class TopicNotFoundError(MosaicoError):
+class TopicNotFoundError(MosaicoError, ValueError):
     pass
 
 

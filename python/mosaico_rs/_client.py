@@ -2,10 +2,21 @@ from __future__ import annotations
 
 import datetime
 import logging
+import operator
+import os
+from collections.abc import Iterator
 from typing import Any, TypeVar
 
-from mosaicolabs import GRPCCompression, GRPCCompressionAlgorithm, Serializable, SessionLevelErrorPolicy
+from mosaicolabs import (
+    GRPCCompression,
+    GRPCCompressionAlgorithm,
+    SequenceOrder,
+    SequencePage,
+    Serializable,
+    SessionLevelErrorPolicy,
+)
 from mosaicolabs.comm.notifications import Notification, NotificationType
+from mosaicolabs.platform.server_config import SemVerItem, ServerConfig, ServerInfo
 
 from . import _core
 from ._errors import InvalidArgumentError
@@ -13,6 +24,9 @@ from ._reader import SequenceHandler, TopicHandler, open_topic
 from ._writer import SequenceUpdater, SequenceWriter
 
 T = TypeVar("T", bound=Serializable)
+
+_TLS_CERT_ENV = "MOSAICO_TLS_CERT_FILE"
+_API_KEY_ENV = "MOSAICO_API_KEY"
 
 _log = logging.getLogger(__name__)
 
@@ -44,6 +58,18 @@ def _tls_cert(path: str | None) -> bytes | None:
         raise FileNotFoundError(f"tls certificate path '{path}' does not exist") from None
     except OSError as e:
         raise InvalidArgumentError(f"cannot read the tls certificate from {path}: {e}") from None
+
+
+def _page_limit(label: str, value: Any) -> int:
+    try:
+        limit = operator.index(value)
+    except TypeError:
+        raise InvalidArgumentError(f"{label} must be an int, not {type(value).__name__}") from None
+    if limit < 0:
+        raise InvalidArgumentError(f"{label} must be >= 0, got {limit}")
+    if limit > 2**32 - 1:
+        raise InvalidArgumentError(f"{label} must be at most {2**32 - 1}, got {limit}")
+    return limit
 
 
 def _datetime(value: str) -> datetime.datetime:
@@ -79,6 +105,8 @@ class MosaicoClient:
         compression: GRPCCompressionAlgorithm | GRPCCompression | str | None = None,
         tls_cert_path: str | None = None,
         api_key: str | None = None,
+        read_window_size: int | None = None,
+        max_streams_per_connection: int | None = None,
     ) -> MosaicoClient:
         core = _core.Client.connect(
             host,
@@ -88,8 +116,22 @@ class MosaicoClient:
             _tls_cert(tls_cert_path),
             api_key,
             _compression(compression),
+            read_window_size,
+            max_streams_per_connection,
         )
         return cls(core)
+
+    @classmethod
+    def from_env(cls, host: str, port: int, timeout: float = 5) -> MosaicoClient:
+        tls_cert = os.environ.get(_TLS_CERT_ENV)
+        return cls.connect(
+            host,
+            port,
+            timeout=timeout,
+            enable_tls=tls_cert is not None,
+            tls_cert_path=tls_cert,
+            api_key=os.environ.get(_API_KEY_ENV),
+        )
 
     def __enter__(self) -> MosaicoClient:
         return self
@@ -97,9 +139,17 @@ class MosaicoClient:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
-    @property
-    def server_version(self) -> str:
-        return self._core.server_version
+    def info(self) -> ServerInfo:
+        version, (major, minor, patch, pre), (decode, encode, target) = self._core.info()
+        return ServerInfo(
+            version=version,
+            semver=SemVerItem(major=major, minor=minor, patch=patch, pre=pre),
+            config=ServerConfig(
+                grpc_max_decode_message_size=decode,
+                grpc_max_encode_message_size=encode,
+                grpc_target_encode_message_size=target,
+            ),
+        )
 
     @property
     def max_batch_size_bytes(self) -> int:
@@ -128,6 +178,35 @@ class MosaicoClient:
 
     def list_sequences(self) -> list[str]:
         return self._core.list_sequences()
+
+    def list_sequences_page(
+        self,
+        limit: int = 50,
+        cursor: bytes | bytearray | memoryview | None = None,
+        order_by: SequenceOrder | None = None,
+    ) -> SequencePage:
+        limit = _page_limit("limit", limit)
+        if cursor is not None:
+            cursor = memoryview(cursor).tobytes()
+        if cursor is not None and order_by is not None:
+            raise InvalidArgumentError("order_by can't be set with a cursor, which carries its order")
+        if order_by is not None and not isinstance(order_by, SequenceOrder):
+            raise InvalidArgumentError(f"order_by must be a SequenceOrder or None, not {order_by!r}")
+        names, next_cursor = self._core.list_sequences_page(
+            limit, cursor, None if order_by is None else order_by.value
+        )
+        return SequencePage(names=names, next_cursor=next_cursor)
+
+    def iter_sequences(
+        self,
+        page_size: int = 50,
+        order_by: SequenceOrder = SequenceOrder.CreatedAt,
+    ) -> Iterator[str]:
+        page = self.list_sequences_page(limit=page_size, order_by=order_by)
+        yield from page.names
+        while page.next_cursor is not None:
+            page = self.list_sequences_page(limit=page_size, cursor=page.next_cursor)
+            yield from page.names
 
     def sequence_delete(self, sequence_name: str) -> None:
         self._core.sequence_delete(sequence_name)

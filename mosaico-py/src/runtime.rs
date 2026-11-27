@@ -1,8 +1,9 @@
+use std::cell::RefCell;
 use std::mem::ManuallyDrop;
 use std::pin::pin;
 use std::ptr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread::Thread;
 use std::time::Duration;
@@ -15,6 +16,58 @@ use crate::errors::{MosaicoError, to_py};
 
 pub(crate) const IO_THREADS: usize = 2;
 pub(crate) const SIGNAL_CHECK_INTERVAL: Duration = Duration::from_millis(100);
+
+static MAIN_THREAD: AtomicU64 = AtomicU64::new(0);
+static MAIN_PID: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    static ENTERED: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+}
+
+pub(crate) fn set_main_thread(py: Python<'_>) -> PyResult<()> {
+    let ident: u64 = py
+        .import("threading")?
+        .call_method0("main_thread")?
+        .getattr("ident")?
+        .extract()?;
+    MAIN_THREAD.store(ident, Ordering::Release);
+    MAIN_PID.store(u64::from(std::process::id()), Ordering::Release);
+    Ok(())
+}
+
+#[allow(clippy::useless_conversion)]
+pub(crate) fn on_main_thread() -> bool {
+    if MAIN_PID.load(Ordering::Acquire) != u64::from(std::process::id()) {
+        return true;
+    }
+    let current = u64::from(unsafe { pyo3::ffi::PyThread_get_thread_ident() });
+    current == MAIN_THREAD.load(Ordering::Acquire)
+}
+
+pub(crate) struct Entered(usize);
+
+pub(crate) fn enter(key: usize) -> PyResult<Entered> {
+    ENTERED.with_borrow_mut(|keys| {
+        if keys.contains(&key) {
+            return Err(MosaicoError::new_err(
+                "this object is waiting in another call on the same thread: a signal \
+                 handler or a finalizer cannot call it until that call returns",
+            ));
+        }
+        keys.push(key);
+        Ok(Entered(key))
+    })
+}
+
+impl Drop for Entered {
+    fn drop(&mut self) {
+        ENTERED.with_borrow_mut(|keys| {
+            if let Some(at) = keys.iter().rposition(|&key| key == self.0) {
+                keys.remove(at);
+            }
+        });
+    }
+}
 
 struct ProcessRuntime {
     pid: u32,
@@ -145,10 +198,10 @@ where
     wait(py, future)?.map_err(to_py)
 }
 
-pub(crate) fn run_now<F, T>(py: Python<'_>, future: F) -> PyResult<T>
+pub(crate) fn wait_now<F>(py: Python<'_>, future: F) -> PyResult<F::Output>
 where
-    F: Future<Output = mosaico_core::Result<T>> + Send,
-    T: Send,
+    F: Future + Send,
+    F::Output: Send,
 {
     let runtime = runtime().map_err(MosaicoError::new_err)?;
     let mut future = pin!(future);
@@ -159,9 +212,17 @@ where
             .poll(&mut Context::from_waker(Waker::noop()))
     };
     match polled {
-        Poll::Ready(result) => result.map_err(to_py),
-        Poll::Pending => run(py, future),
+        Poll::Ready(output) => Ok(output),
+        Poll::Pending => wait(py, future),
     }
+}
+
+pub(crate) fn run_now<F, T>(py: Python<'_>, future: F) -> PyResult<T>
+where
+    F: Future<Output = mosaico_core::Result<T>> + Send,
+    T: Send,
+{
+    wait_now(py, future)?.map_err(to_py)
 }
 
 pub(crate) struct ProcessBound<T> {

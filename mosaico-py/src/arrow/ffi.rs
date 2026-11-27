@@ -15,7 +15,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyCapsule, PyCapsuleMethods, PyTuple};
 
 use crate::errors::invalid;
-use crate::runtime::{ProcessBound, SIGNAL_CHECK_INTERVAL, block_on, runtime};
+use crate::runtime::{ProcessBound, SIGNAL_CHECK_INTERVAL, block_on, on_main_thread, runtime};
 
 #[pyclass(frozen, module = "mosaico_rs._core")]
 pub(crate) struct SchemaHolder(pub(crate) SchemaRef);
@@ -330,13 +330,19 @@ pub(crate) fn arrow_error(error: ArrowError) -> PyErr {
 pub(crate) struct BlockingReader {
     schema: SchemaRef,
     streamer: ProcessBound<mosaico_core::TopicBatchStreamer>,
+    pending: Option<RecordBatch>,
 }
 
 impl BlockingReader {
-    pub(crate) fn new(schema: SchemaRef, streamer: mosaico_core::TopicBatchStreamer) -> Self {
+    pub(crate) fn new(
+        schema: SchemaRef,
+        streamer: mosaico_core::TopicBatchStreamer,
+        pending: Option<RecordBatch>,
+    ) -> Self {
         Self {
             schema,
             streamer: ProcessBound::new(streamer),
+            pending,
         }
     }
 }
@@ -345,6 +351,9 @@ impl Iterator for BlockingReader {
     type Item = Result<RecordBatch, ArrowError>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if let Some(batch) = self.pending.take() {
+            return Some(Ok(batch));
+        }
         let streamer = match self.streamer.get_mut() {
             Ok(streamer) => streamer,
             Err(message) => return Some(Err(external(message))),
@@ -384,6 +393,9 @@ fn next_blocking(
 }
 
 fn interrupted() -> Option<String> {
+    if !on_main_thread() {
+        return None;
+    }
     Python::attach(|py| {
         let error = py.check_signals().err()?;
         let name = error

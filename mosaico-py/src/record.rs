@@ -4,6 +4,7 @@ use mosaico_ontology::{
     CompressedImage, Header, Image, ImageFormat, Imu, Quaternion, Time, Vector3d,
 };
 use pyo3::buffer::PyBuffer;
+use pyo3::conversion::FromPyObjectOwned;
 use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
@@ -18,33 +19,62 @@ fn optional<'py>(
     Ok((!value.is_none()).then_some(value))
 }
 
+fn field<'py, T: FromPyObjectOwned<'py>>(
+    object: &Bound<'py, PyAny>,
+    name: &Bound<'py, PyString>,
+) -> PyResult<T> {
+    object
+        .getattr(name)
+        .and_then(|value| value.extract::<T>().map_err(Into::into))
+        .map_err(|e| at(name, e))
+}
+
+fn at(name: &Bound<'_, PyString>, error: PyErr) -> PyErr {
+    let py = name.py();
+    let message = error
+        .value(py)
+        .str()
+        .map_or_else(|_| error.to_string(), |text| text.to_string());
+    match message.strip_prefix("field '") {
+        Some(rest) => invalid(format!("field '{name}.{rest}")),
+        None => invalid(format!("field '{name}': {message}")),
+    }
+}
+
+fn nested<'py, T>(
+    object: &Bound<'py, PyAny>,
+    name: &Bound<'py, PyString>,
+    convert: impl FnOnce(&Bound<'py, PyAny>) -> PyResult<T>,
+) -> PyResult<Option<T>> {
+    optional(object, name)
+        .and_then(|value| value.map(|v| convert(&v)).transpose())
+        .map_err(|e| at(name, e))
+}
+
 fn time(object: &Bound<'_, PyAny>) -> PyResult<Time> {
     let py = object.py();
     Ok(Time {
-        seconds: object.getattr(intern!(py, "seconds"))?.extract()?,
-        nanoseconds: object.getattr(intern!(py, "nanoseconds"))?.extract()?,
+        seconds: field(object, intern!(py, "seconds"))?,
+        nanoseconds: field(object, intern!(py, "nanoseconds"))?,
     })
 }
 
 fn header(object: &Bound<'_, PyAny>) -> PyResult<Option<Header>> {
     let py = object.py();
-    let Some(header) = optional(object, intern!(py, "header"))? else {
-        return Ok(None);
-    };
-    Ok(Some(Header {
-        timestamp: optional(&header, intern!(py, "timestamp"))?
-            .map(|t| time(&t))
-            .transpose()?,
-        frame_id: header.getattr(intern!(py, "frame_id"))?.extract()?,
-        sample_counter: header.getattr(intern!(py, "sample_counter"))?.extract()?,
-    }))
+    nested(object, intern!(py, "header"), |header| {
+        Ok(Header {
+            timestamp: nested(header, intern!(py, "timestamp"), time)?,
+            frame_id: field(header, intern!(py, "frame_id"))?,
+            sample_counter: field(header, intern!(py, "sample_counter"))?,
+        })
+    })
 }
 
 fn covariance(object: &Bound<'_, PyAny>) -> PyResult<(Option<Vec<f64>>, Option<i16>)> {
     let py = object.py();
     Ok((
-        object.getattr(intern!(py, "covariance"))?.extract()?,
-        object.getattr(intern!(py, "covariance_type"))?.extract()?,
+        field(object, intern!(py, "covariance"))?,
+        field(object, intern!(py, "covariance_type"))?,
     ))
 }
 
@@ -52,9 +82,9 @@ fn vector3d(object: &Bound<'_, PyAny>) -> PyResult<Vector3d> {
     let py = object.py();
     let (covariance, covariance_type) = covariance(object)?;
     Ok(Vector3d {
-        x: object.getattr(intern!(py, "x"))?.extract()?,
-        y: object.getattr(intern!(py, "y"))?.extract()?,
-        z: object.getattr(intern!(py, "z"))?.extract()?,
+        x: field(object, intern!(py, "x"))?,
+        y: field(object, intern!(py, "y"))?,
+        z: field(object, intern!(py, "z"))?,
         covariance,
         covariance_type,
         header: header(object)?,
@@ -65,32 +95,31 @@ fn quaternion(object: &Bound<'_, PyAny>) -> PyResult<Quaternion> {
     let py = object.py();
     let (covariance, covariance_type) = covariance(object)?;
     Ok(Quaternion {
-        x: object.getattr(intern!(py, "x"))?.extract()?,
-        y: object.getattr(intern!(py, "y"))?.extract()?,
-        z: object.getattr(intern!(py, "z"))?.extract()?,
-        w: object.getattr(intern!(py, "w"))?.extract()?,
+        x: field(object, intern!(py, "x"))?,
+        y: field(object, intern!(py, "y"))?,
+        z: field(object, intern!(py, "z"))?,
+        w: field(object, intern!(py, "w"))?,
         covariance,
         covariance_type,
         header: header(object)?,
     })
 }
 
-fn required<'py>(
+fn required<'py, T>(
     object: &Bound<'py, PyAny>,
     name: &Bound<'py, PyString>,
-) -> PyResult<Bound<'py, PyAny>> {
-    optional(object, name)?.ok_or_else(|| invalid(format!("field '{name}' is required")))
+    convert: impl FnOnce(&Bound<'py, PyAny>) -> PyResult<T>,
+) -> PyResult<T> {
+    nested(object, name, convert)?.ok_or_else(|| invalid(format!("field '{name}' is required")))
 }
 
 pub(crate) fn imu(object: &Bound<'_, PyAny>) -> PyResult<Imu> {
     let py = object.py();
     Ok(Imu {
         header: header(object)?,
-        acceleration: vector3d(&required(object, intern!(py, "acceleration"))?)?,
-        angular_velocity: vector3d(&required(object, intern!(py, "angular_velocity"))?)?,
-        orientation: optional(object, intern!(py, "orientation"))?
-            .map(|o| quaternion(&o))
-            .transpose()?,
+        acceleration: required(object, intern!(py, "acceleration"), vector3d)?,
+        angular_velocity: required(object, intern!(py, "angular_velocity"), vector3d)?,
+        orientation: nested(object, intern!(py, "orientation"), quaternion)?,
     })
 }
 
@@ -111,8 +140,9 @@ fn bytes(object: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
 
 fn format(object: &Bound<'_, PyAny>) -> PyResult<ImageFormat> {
     let py = object.py();
-    let format: String = object.getattr(intern!(py, "format"))?.extract()?;
-    ImageFormat::from_str(&format).map_err(|e| invalid(e.to_string()))
+    let name = intern!(py, "format");
+    let format: String = field(object, name)?;
+    ImageFormat::from_str(&format).map_err(|e| at(name, invalid(e.to_string())))
 }
 
 pub(crate) fn image(object: &Bound<'_, PyAny>) -> PyResult<Image> {
@@ -121,11 +151,11 @@ pub(crate) fn image(object: &Bound<'_, PyAny>) -> PyResult<Image> {
         header: header(object)?,
         data: bytes(object)?,
         format: format(object)?,
-        width: object.getattr(intern!(py, "width"))?.extract()?,
-        height: object.getattr(intern!(py, "height"))?.extract()?,
-        stride: object.getattr(intern!(py, "stride"))?.extract()?,
-        encoding: object.getattr(intern!(py, "encoding"))?.extract()?,
-        is_bigendian: object.getattr(intern!(py, "is_bigendian"))?.extract()?,
+        width: field(object, intern!(py, "width"))?,
+        height: field(object, intern!(py, "height"))?,
+        stride: field(object, intern!(py, "stride"))?,
+        encoding: field(object, intern!(py, "encoding"))?,
+        is_bigendian: field(object, intern!(py, "is_bigendian"))?,
     })
 }
 

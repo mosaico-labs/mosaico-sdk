@@ -14,9 +14,10 @@ from ._errors import (
     TopicNotFoundError,
 )
 from ._image import decode_png, decode_png_batch, decode_png_table, encode_png, encode_png_batch, image_from_linear_pixels
-from ._views import HeaderView, IMUView, QuaternionView, TimeView, Vector3dView
+from ._views import CompressedImageView, HeaderView, ImageView, IMUView, QuaternionView, TimeView, Vector3dView
 from ._reader import (
     Message,
+    SequenceDataStreamer,
     SequenceHandler,
     SessionInfo,
     TopicBatchStreamer,
@@ -27,9 +28,11 @@ from ._writer import SequenceUpdater, SequenceWriter, TopicWriter
 
 __all__ = [
     "AlreadyExistsError",
+    "CompressedImageView",
     "ConnectError",
     "HeaderView",
     "IMUView",
+    "ImageView",
     "InvalidArgumentError",
     "Message",
     "MosaicoClient",
@@ -38,6 +41,7 @@ __all__ = [
     "PermissionDeniedError",
     "QuaternionView",
     "SchemaError",
+    "SequenceDataStreamer",
     "SequenceHandler",
     "SequenceNotFoundError",
     "SequenceUpdater",
