@@ -1,16 +1,22 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema, SchemaRef};
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::read::batch_reader::BatchReader;
-use crate::scope::Token;
+use crate::scope::{self, Token};
+use crate::time::Timestamp;
 
 #[derive(Clone)]
 pub struct CloseHandle(Arc<Token>);
 
 impl CloseHandle {
+    pub(crate) fn new(token: Arc<Token>) -> Self {
+        Self(token)
+    }
+
     pub fn is_closed(&self) -> bool {
         self.0.is_closed()
     }
@@ -18,13 +24,26 @@ impl CloseHandle {
     pub fn close(&self) {
         self.0.close();
     }
+
+    #[doc(hidden)]
+    pub fn any_closed(handles: &[CloseHandle], checked: &AtomicU64) -> bool {
+        let closes = scope::closes();
+        if checked.load(Ordering::Acquire) == closes {
+            return false;
+        }
+        if handles.iter().any(CloseHandle::is_closed) {
+            return true;
+        }
+        checked.store(closes, Ordering::Release);
+        false
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct ReadInfo {
     pub(crate) msg_count: u64,
-    pub(crate) timestamp_ns_min: Option<i64>,
-    pub(crate) timestamp_ns_max: Option<i64>,
+    pub(crate) timestamp_ns_min: Option<Timestamp>,
+    pub(crate) timestamp_ns_max: Option<Timestamp>,
 }
 
 pub struct TopicBatchStreamer {
@@ -65,20 +84,16 @@ impl TopicBatchStreamer {
         self.info.msg_count
     }
 
-    pub fn timestamp_ns_min(&self) -> Option<i64> {
+    pub fn timestamp_ns_min(&self) -> Option<Timestamp> {
         self.info.timestamp_ns_min
     }
 
-    pub fn timestamp_ns_max(&self) -> Option<i64> {
+    pub fn timestamp_ns_max(&self) -> Option<Timestamp> {
         self.info.timestamp_ns_max
     }
 
     pub(crate) fn info(&self) -> ReadInfo {
         self.info
-    }
-
-    pub(crate) fn token(&self) -> Arc<Token> {
-        self.token.clone()
     }
 
     pub async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
@@ -135,6 +150,20 @@ mod tests {
 
     fn batch(values: &[i64]) -> RecordBatch {
         RecordBatch::try_new(schema(), vec![Arc::new(Int64Array::from(values.to_vec()))]).unwrap()
+    }
+
+    #[test]
+    fn any_closed_sees_close() {
+        let scope = crate::scope::Scope::root();
+        let handles = vec![
+            CloseHandle::new(scope.token()),
+            CloseHandle::new(scope.token()),
+        ];
+        let checked = AtomicU64::new(u64::MAX);
+        assert!(!CloseHandle::any_closed(&handles, &checked));
+        assert!(!CloseHandle::any_closed(&handles, &checked));
+        handles[1].close();
+        assert!(CloseHandle::any_closed(&handles, &checked));
     }
 
     #[tokio::test]

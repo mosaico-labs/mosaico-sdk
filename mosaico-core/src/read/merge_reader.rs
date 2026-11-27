@@ -1,20 +1,43 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::pin::pin;
+use std::sync::Arc;
 
 use arrow_array::{Int64Array, RecordBatch};
+use arrow_schema::SchemaRef;
 use futures::future::{self, Either};
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::read::data_streamer::timestamps;
-use crate::read::streamer::TopicBatchStreamer;
+use crate::read::streamer::{CloseHandle, TopicBatchStreamer};
+use crate::scope::{self, Token};
 
 pub(crate) const WINDOW_ROWS: usize = 65_536;
+const MAX_TOPICS: usize = u16::MAX as usize + 1;
+
+pub(crate) fn check_topic_count(topics: usize) -> Result<()> {
+    if topics > MAX_TOPICS {
+        return Err(Error::new(
+            ErrorKind::InvalidArgument,
+            format!("{topics} topics, at most {MAX_TOPICS} in one read"),
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
-pub(crate) struct Window {
-    pub(crate) batches: Vec<(u16, RecordBatch)>,
-    pub(crate) order: Vec<u16>,
+#[non_exhaustive]
+pub struct MergeWindow {
+    pub batches: Vec<WindowBatch>,
+    pub order: Vec<u16>,
+}
+
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct WindowBatch {
+    pub topic: u16,
+    pub batch: RecordBatch,
+    pub timestamps: Int64Array,
 }
 
 struct Head {
@@ -32,23 +55,26 @@ impl Head {
 pub(crate) struct MergeReader {
     heads: Vec<Head>,
     queue: BinaryHeap<Reverse<(i64, u16)>>,
-    pending: Vec<(u16, RecordBatch)>,
+    pending: Vec<WindowBatch>,
     max_rows: usize,
     closed: bool,
+    checked: u64,
+    token: Arc<Token>,
+    labels: Vec<String>,
 }
 
 impl MergeReader {
+    #[cfg(test)]
     pub(crate) fn new(streams: Vec<TopicBatchStreamer>, max_rows: usize) -> Result<Self> {
-        if streams.len() > usize::from(u16::MAX) + 1 {
-            return Err(Error::new(
-                ErrorKind::InvalidArgument,
-                format!(
-                    "{} topics, at most {} in one read",
-                    streams.len(),
-                    u16::MAX as usize + 1
-                ),
-            ));
-        }
+        Self::with_token(streams, max_rows, crate::scope::Scope::root().token())
+    }
+
+    pub(crate) fn with_token(
+        streams: Vec<TopicBatchStreamer>,
+        max_rows: usize,
+        token: Arc<Token>,
+    ) -> Result<Self> {
+        check_topic_count(streams.len())?;
         Ok(Self {
             heads: streams
                 .into_iter()
@@ -62,10 +88,18 @@ impl MergeReader {
             pending: Vec::new(),
             max_rows: max_rows.max(1),
             closed: false,
+            checked: u64::MAX,
+            token,
+            labels: Vec::new(),
         })
     }
 
-    pub(crate) async fn next_window(&mut self) -> Result<Option<Window>> {
+    pub(crate) fn labeled(mut self, labels: Vec<String>) -> Self {
+        self.labels = labels;
+        self
+    }
+
+    pub(crate) async fn next_window(&mut self) -> Result<Option<MergeWindow>> {
         self.ensure_open()?;
         for topic in 0..self.heads.len() {
             if !self.heads[topic].needs_batch() {
@@ -73,7 +107,10 @@ impl MergeReader {
             }
             if let Err(e) = self.load(topic).await {
                 self.close();
-                return Err(e);
+                return Err(match self.labels.get(topic) {
+                    Some(label) => e.in_topic(label),
+                    None => e,
+                });
             }
         }
         let batches = std::mem::take(&mut self.pending);
@@ -95,11 +132,26 @@ impl MergeReader {
         if order.is_empty() {
             return Ok(None);
         }
-        Ok(Some(Window { batches, order }))
+        Ok(Some(MergeWindow { batches, order }))
+    }
+
+    pub(crate) fn schemas(&self) -> Vec<SchemaRef> {
+        self.heads
+            .iter()
+            .map(|h| h.stream.schema().clone())
+            .collect()
+    }
+
+    pub(crate) fn close_handles(&self) -> Vec<CloseHandle> {
+        let own = CloseHandle::new(self.token.clone());
+        std::iter::once(own)
+            .chain(self.heads.iter().map(|h| h.stream.close_handle()))
+            .collect()
     }
 
     pub(crate) fn close(&mut self) {
         self.closed = true;
+        self.token.close();
         self.queue.clear();
         self.pending.clear();
         for head in &mut self.heads {
@@ -112,34 +164,33 @@ impl MergeReader {
         if self.closed {
             return Err(Error::new(ErrorKind::Closed, "stream closed"));
         }
+        let closes = scope::closes();
+        if closes == self.checked {
+            return Ok(());
+        }
+        if self.token.is_closed() {
+            self.close();
+            return Err(Error::new(ErrorKind::Closed, "stream closed"));
+        }
         if let Err(e) = self.heads.iter().try_for_each(|h| h.stream.ensure_open()) {
             self.close();
             return Err(e);
         }
+        self.checked = closes;
         Ok(())
     }
 
     async fn load(&mut self, topic: usize) -> Result<()> {
-        let others: Vec<_> = self
-            .heads
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != topic)
-            .map(|(_, h)| h.stream.token())
-            .collect();
-        let head = &mut self.heads[topic];
         loop {
+            let mut notice = pin!(scope::close_notice());
+            notice.as_mut().enable();
+            self.ensure_open()?;
+            let head = &mut self.heads[topic];
             let next = {
                 let wait = pin!(head.stream.next_batch());
-                let closed = pin!(async {
-                    if others.is_empty() {
-                        future::pending::<()>().await;
-                    }
-                    future::select_all(others.iter().map(|t| Box::pin(t.closed()))).await;
-                });
-                match future::select(wait, closed).await {
+                match future::select(wait, notice).await {
                     Either::Left((next, _)) => next?,
-                    Either::Right(_) => return Err(Error::new(ErrorKind::Closed, "stream closed")),
+                    Either::Right(_) => continue,
                 }
             };
             let Some(batch) = next else {
@@ -151,9 +202,13 @@ impl MergeReader {
             }
             let t = timestamps(&batch)?;
             self.queue.push(Reverse((t.value(0), topic as u16)));
-            head.timestamps = Some(t);
+            head.timestamps = Some(t.clone());
             head.row = 0;
-            self.pending.push((topic as u16, batch));
+            self.pending.push(WindowBatch {
+                topic: topic as u16,
+                batch,
+                timestamps: t,
+            });
             return Ok(());
         }
     }
@@ -200,11 +255,12 @@ mod tests {
         let mut current: HashMap<u16, (Int64Array, usize)> = HashMap::new();
         let mut out = Vec::new();
         while let Some(window) = reader.next_window().await? {
-            for (k, b) in window.batches {
-                if let Some((t, i)) = current.get(&k) {
+            for b in window.batches {
+                if let Some((t, i)) = current.get(&b.topic) {
                     assert_eq!(*i, t.len(), "batch replaced before it was used up");
                 }
-                current.insert(k, (timestamps(&b).unwrap(), 0));
+                assert_eq!(b.timestamps, timestamps(&b.batch).unwrap());
+                current.insert(b.topic, (b.timestamps, 0));
             }
             for k in window.order {
                 let (t, i) = current.get_mut(&k).unwrap();
@@ -256,6 +312,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn topic_cap() {
+        let token = Scope::root().token();
+        let empty = |n: usize| -> Vec<TopicBatchStreamer> {
+            (0..n)
+                .map(|_| TopicBatchStreamer::empty(token.clone()))
+                .collect()
+        };
+        let cap = MAX_TOPICS;
+        let error = MergeReader::new(empty(cap + 1), WINDOW_ROWS).err().unwrap();
+        assert_eq!(error.kind(), ErrorKind::InvalidArgument);
+        assert!(error.to_string().contains("65536"), "{error}");
+        let mut streams = empty(cap - 2);
+        streams.push(topic(&[&[2, 4]], Tail::End).await);
+        streams.push(topic(&[&[1, 3]], Tail::End).await);
+        let mut reader = MergeReader::new(streams, WINDOW_ROWS).unwrap();
+        assert_eq!(
+            rows(&mut reader).await.unwrap(),
+            vec![
+                (u16::MAX, 1),
+                (u16::MAX - 1, 2),
+                (u16::MAX, 3),
+                (u16::MAX - 1, 4)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn own_token_closes() {
+        let scope = Scope::root();
+        let mut reader = MergeReader::with_token(Vec::new(), 10, scope.token()).unwrap();
+        assert_eq!(reader.close_handles().len(), 1);
+        scope.close();
+        let error = reader.next_window().await.err().unwrap();
+        assert_eq!(error.kind(), ErrorKind::Closed);
+    }
+
+    #[tokio::test]
     async fn all_empty_ends() {
         let streams = vec![topic(&[], Tail::End).await, topic(&[&[]], Tail::End).await];
         let mut reader = MergeReader::new(streams, WINDOW_ROWS).unwrap();
@@ -276,7 +369,7 @@ mod tests {
             first
                 .batches
                 .iter()
-                .map(|(k, b)| (*k, b.num_rows()))
+                .map(|b| (b.topic, b.batch.num_rows()))
                 .collect::<Vec<_>>(),
             vec![(0, 2), (1, 1)]
         );
@@ -334,11 +427,15 @@ mod tests {
             streamer(schema(true), vec![nulls], Tail::End).await,
             topic(&[&[2]], Tail::End).await,
         ];
-        let mut reader = MergeReader::new(streams, WINDOW_ROWS).unwrap();
+        let mut reader = MergeReader::new(streams, WINDOW_ROWS)
+            .unwrap()
+            .labeled(vec!["seq/a".to_owned(), "seq/b".to_owned()]);
         let failed = reader.next_window().await.unwrap_err();
         assert_eq!(failed.kind(), ErrorKind::Schema);
+        assert!(failed.to_string().starts_with("topic 'seq/a': "));
         let closed = reader.next_window().await.unwrap_err();
         assert_eq!(closed.kind(), ErrorKind::Closed);
+        assert_eq!(closed.to_string(), "stream closed");
     }
 
     #[tokio::test]
@@ -417,5 +514,25 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(ended.unwrap_err().kind(), ErrorKind::Closed);
+    }
+
+    #[tokio::test]
+    async fn unrelated_close_ignored() {
+        let streams = vec![
+            topic(&[&[1]], Tail::End).await,
+            delayed(schema(false), vec![batch(&[2])], Duration::from_millis(100)).await,
+        ];
+        let mut reader = MergeReader::new(streams, WINDOW_ROWS).unwrap();
+        let waiting = tokio::spawn(async move {
+            let window = reader.next_window().await?;
+            Ok::<_, Error>(window.map(|w| (w.order, w.batches.len())))
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        Scope::root().token().close();
+        let ended = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ended.unwrap(), Some((vec![0], 2)));
     }
 }

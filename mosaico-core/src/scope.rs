@@ -1,7 +1,50 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::ptr;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use tokio::sync::Notify;
+use tokio::sync::futures::Notified;
 use tokio_util::sync::CancellationToken;
+
+static CLOSES: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn closes() -> u64 {
+    CLOSES.load(Ordering::Acquire)
+}
+
+pub(crate) fn close_notice() -> Notified<'static> {
+    notice().notified()
+}
+
+struct ProcessNotice {
+    pid: u32,
+    notify: Notify,
+}
+
+fn notice() -> &'static Notify {
+    static CURRENT: AtomicPtr<ProcessNotice> = AtomicPtr::new(ptr::null_mut());
+
+    let pid = std::process::id();
+    let mut current = CURRENT.load(Ordering::Acquire);
+    loop {
+        if let Some(installed) = unsafe { current.as_ref() }
+            && installed.pid == pid
+        {
+            return &installed.notify;
+        }
+        let new = Box::into_raw(Box::new(ProcessNotice {
+            pid,
+            notify: Notify::new(),
+        }));
+        match CURRENT.compare_exchange(current, new, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return unsafe { &(*new).notify },
+            Err(installed) => {
+                drop(unsafe { Box::from_raw(new) });
+                current = installed;
+            }
+        }
+    }
+}
 
 pub(crate) struct Token {
     closed: AtomicBool,
@@ -35,11 +78,9 @@ impl Token {
 
     pub(crate) fn close(&self) {
         self.closed.store(true, Ordering::Release);
+        CLOSES.fetch_add(1, Ordering::AcqRel);
         self.cancel.cancel();
-    }
-
-    pub(crate) async fn closed(&self) {
-        self.cancel.cancelled().await;
+        notice().notify_waiters();
     }
 
     pub(crate) async fn run_until_closed<F: Future>(&self, future: F) -> Option<F::Output> {
@@ -87,6 +128,10 @@ impl Scope {
 
     pub(crate) fn close(&self) {
         self.current().close();
+    }
+
+    pub(crate) fn same(&self, other: &Scope) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
     }
 
     fn current(&self) -> MutexGuard<'_, Arc<Token>> {
