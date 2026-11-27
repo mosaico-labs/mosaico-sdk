@@ -14,7 +14,7 @@ pub use client::{MosaicoClient, Notification};
 pub use comm::connection::{Compression, ConnectOptions, SemVerItem, ServerConfig, ServerInfo};
 pub use error::{Error, ErrorKind, Result};
 pub use listing::{PageStart, SequenceCursor, SequenceNames, SequenceOrder, SequencePage};
-pub use locator::topic_name;
+pub use locator::{check_sequence_name, topic_name};
 pub use metadata::UserMetadata;
 pub use ontology::{Encode, Format, Message, Ontology, RecordBuilder};
 pub use read::data_streamer::TopicDataStreamer;

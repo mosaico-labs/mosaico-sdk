@@ -19,6 +19,11 @@ pub(crate) fn sequence_name(raw: &str) -> Result<&str> {
     Ok(name)
 }
 
+#[doc(hidden)]
+pub fn check_sequence_name(raw: &str) -> Result<()> {
+    new_sequence_name(raw).map(drop)
+}
+
 pub(crate) fn new_sequence_name(raw: &str) -> Result<&str> {
     let name = sequence_name(raw)?;
     check_new_name("sequence", raw, name, false)?;

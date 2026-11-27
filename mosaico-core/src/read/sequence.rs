@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use futures::TryFutureExt;
 use futures::future::try_join_all;
 use prost::Message;
 use serde::de::DeserializeOwned;
@@ -267,7 +268,12 @@ async fn open_streams(
     range: TimestampRange,
 ) -> Result<Vec<TopicBatchStreamer>> {
     let ranged = !range.is_all();
-    let plans = try_join_all(topics.iter().map(|t| t.read_plan(range))).await?;
+    let plans = try_join_all(
+        topics
+            .iter()
+            .map(|t| t.read_plan(range).map_err(|e| from_topic(e, t))),
+    )
+    .await?;
     let plans: Vec<_> = plans
         .into_iter()
         .map(|p| if ranged { p.skip_if_empty() } else { p })
@@ -287,10 +293,18 @@ async fn open_streams(
             } else {
                 connection
             };
-            t.open_plan(reader, plan)
+            t.open_plan(reader, plan).map_err(|e| from_topic(e, t))
         })
         .collect();
     try_join_all(opens).await
+}
+
+fn from_topic(error: Error, topic: &TopicHandler) -> Error {
+    if error.kind() == ErrorKind::NotFound {
+        error
+    } else {
+        error.in_topic(&topic.locator())
+    }
 }
 
 #[cfg(test)]
@@ -438,6 +452,25 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(opened.err().unwrap().kind(), ErrorKind::Closed);
+    }
+
+    #[tokio::test]
+    async fn open_error_names_topic() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let seq = offline_on(Connection::offline_at(1 << 20, port), &["/a"]);
+        let error = seq.get_data_streamer(&[], 1..5).await.err().unwrap();
+        assert_eq!(error.kind(), ErrorKind::Connection);
+        assert!(error.to_string().starts_with("topic 'seq/a': "), "{error}");
+        assert_eq!(error.to_string().matches("seq/a").count(), 1, "{error}");
+        let labelled = error.in_topic("seq/a");
+        assert_eq!(labelled.to_string().matches("seq/a").count(), 1);
+        let missing = Error::new(ErrorKind::NotFound, "topic 'seq/a' not found");
+        assert_eq!(
+            from_topic(missing, &seq.topics[0]).to_string(),
+            "topic 'seq/a' not found"
+        );
     }
 
     #[tokio::test]

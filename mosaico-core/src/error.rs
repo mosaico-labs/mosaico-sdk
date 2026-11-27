@@ -78,8 +78,9 @@ impl Error {
     }
 
     pub(crate) fn in_topic(mut self, locator: &str) -> Self {
-        if self.kind != ErrorKind::Closed {
-            self.message = format!("topic '{locator}': {}", self.message);
+        let label = format!("topic '{locator}': ");
+        if self.kind != ErrorKind::Closed && !self.message.starts_with(&label) {
+            self.message.insert_str(0, &label);
         }
         self
     }

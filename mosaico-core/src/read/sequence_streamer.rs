@@ -259,7 +259,10 @@ impl<'a> RowRef<'a> {
             .columns
             .get_or_init(|| match T::columns(&current.batch) {
                 Ok(columns) => Cached::Ready(id, Box::new(columns)),
-                Err(e) => Cached::Failed(id, e.kind(), e.to_string()),
+                Err(e) => {
+                    let e = e.in_topic(&self.topic.locator());
+                    Cached::Failed(id, e.kind(), e.to_string())
+                }
             });
         let columns = match cached {
             Cached::Ready(ready, columns) if *ready == id => columns.downcast_ref::<T::Columns>(),
@@ -484,9 +487,11 @@ mod tests {
             DataType::Int64,
             false,
         )]));
-        let batch =
-            RecordBatch::try_new(only_time.clone(), vec![Arc::new(Int64Array::from(vec![1]))])
-                .unwrap();
+        let batch = RecordBatch::try_new(
+            only_time.clone(),
+            vec![Arc::new(Int64Array::from(vec![1, 2]))],
+        )
+        .unwrap();
         let stream = streamer_with(
             only_time,
             vec![batch],
@@ -503,6 +508,8 @@ mod tests {
         assert_eq!(first.kind(), ErrorKind::Schema);
         assert_eq!(again.kind(), ErrorKind::Schema);
         assert_eq!(first.to_string(), again.to_string());
+        assert!(first.to_string().starts_with("topic 'seq/a': "), "{first}");
+        assert_eq!(first.to_string().matches("seq/a").count(), 1);
         assert_eq!(
             row.view::<Twin>().unwrap_err().kind(),
             ErrorKind::InvalidArgument
@@ -510,6 +517,12 @@ mod tests {
         assert_eq!(
             row.view::<Same>().unwrap_err().kind(),
             ErrorKind::InvalidArgument
+        );
+        let next = streamer.next().await.unwrap().unwrap();
+        assert_eq!(next.row(), 1);
+        assert_eq!(
+            next.view::<Value>().unwrap_err().to_string(),
+            first.to_string()
         );
     }
 
