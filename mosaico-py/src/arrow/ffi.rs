@@ -1,4 +1,5 @@
-use std::ffi::{CStr, c_char, c_void};
+use std::cell::RefCell;
+use std::ffi::{CStr, c_char, c_int, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::pin;
 use std::ptr;
@@ -30,7 +31,18 @@ impl SchemaHolder {
 #[pyclass(frozen, module = "mosaico_rs._core")]
 pub(crate) struct RawBatch {
     batch: RecordBatch,
-    exported: OnceLock<Box<FFI_ArrowArray>>,
+    exported: OnceLock<Exported>,
+}
+
+struct Exported(*mut FFI_ArrowArray);
+
+unsafe impl Send for Exported {}
+unsafe impl Sync for Exported {}
+
+impl Drop for Exported {
+    fn drop(&mut self) {
+        drop(unsafe { Box::from_raw(self.0) });
+    }
 }
 
 impl RawBatch {
@@ -47,9 +59,9 @@ impl RawBatch {
     fn array_address(&self) -> usize {
         let exported = self.exported.get_or_init(|| {
             let data = StructArray::from(self.batch.clone()).into_data();
-            Box::new(FFI_ArrowArray::new(&data))
+            Exported(Box::into_raw(Box::new(FFI_ArrowArray::new(&data))))
         });
-        ptr::from_ref::<FFI_ArrowArray>(exported) as usize
+        exported.0 as usize
     }
 
     #[pyo3(signature = (requested_schema = None))]
@@ -405,9 +417,43 @@ fn interrupted() -> Option<String> {
             .unwrap_or_default();
         if error.is_instance_of::<PyKeyboardInterrupt>(py) {
             unsafe { pyo3::ffi::PyErr_SetInterrupt() };
+        } else {
+            raise_later(error);
         }
         Some(format!("interrupted by {name}"))
     })
+}
+
+thread_local! {
+    static RAISED: RefCell<Option<PyErr>> = const { RefCell::new(None) };
+}
+
+fn raise_later(error: PyErr) {
+    let first = RAISED.with_borrow_mut(|saved| saved.is_none() && saved.replace(error).is_none());
+    if first && unsafe { pyo3::ffi::Py_AddPendingCall(Some(raise_saved), ptr::null_mut()) } != 0 {
+        RAISED.with_borrow_mut(Option::take);
+    }
+}
+
+extern "C" fn raise_saved(_: *mut c_void) -> c_int {
+    match RAISED.with_borrow_mut(Option::take) {
+        Some(error) => {
+            Python::attach(|py| {
+                if let Some(handled) = handled(py) {
+                    error.set_context(py, Some(handled));
+                }
+                error.restore(py);
+            });
+            -1
+        }
+        None => 0,
+    }
+}
+
+fn handled(py: Python<'_>) -> Option<PyErr> {
+    let info = py.import("sys").ok()?.call_method0("exc_info").ok()?;
+    let value = info.get_item(1).ok()?;
+    (!value.is_none()).then(|| PyErr::from_value(value))
 }
 
 fn external(message: impl Into<String>) -> ArrowError {

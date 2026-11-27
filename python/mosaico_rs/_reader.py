@@ -388,6 +388,11 @@ class TopicBatchStreamer:
             return empty.__arrow_c_stream__(requested_schema)  # pyright: ignore[reportArgumentType]
         return self._stream.export(self._seen)
 
+    def __arrow_c_schema__(self) -> object:
+        if len(pa.schema(self._stream.schema)) == 0:  # pyright: ignore[reportArgumentType]
+            return self._schema.__arrow_c_schema__()
+        return self._stream.schema.__arrow_c_schema__()
+
     def close(self) -> None:
         self._stream.close()
 
@@ -592,7 +597,9 @@ class Message(Generic[T]):
     timestamp_ns: int
     data: Any
 
-    def __init__(self, timestamp_ns: int, data: Any, spec: OntologySpec) -> None:
+    def __init__(self, timestamp_ns: int, data: Any, spec: OntologySpec | None = None) -> None:
+        if spec is None and not isinstance(data, Serializable):
+            raise InvalidArgumentError(f"message data must be an ontology object, not {type(data).__name__}")
         self.timestamp_ns = timestamp_ns
         self.data = data
         self._spec = spec
@@ -605,12 +612,18 @@ class Message(Generic[T]):
     @overload
     def get_data(self, target_type: type[S]) -> S | None: ...
     def get_data(self, target_type: type[Serializable] | None = None) -> Serializable | None:
-        if target_type is not None and not issubclass(self._spec.ontology, target_type):
+        if target_type is not None and not issubclass(self.ontology_type(), target_type):
             return None
+        if self._spec is None:
+            return self.data
         return self._spec.build(self.data)
 
     def ontology_type(self) -> type[Serializable]:
+        if self._spec is None:
+            return type(self.data)
         return self._spec.ontology
 
     def ontology_tag(self) -> str:
+        if self._spec is None:
+            return type(self.data).ontology_tag()
         return self._spec.tag

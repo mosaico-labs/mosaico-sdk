@@ -22,6 +22,7 @@ from mosaicolabs import (
 
 from . import _core
 from ._errors import InvalidArgumentError, TopicNotFoundError
+from ._reader import Message as ReadMessage
 from ._schema import check_ontology, is_int64, wire_schema
 
 _TERMINAL = (TopicWriterStatus.Finalized, TopicWriterStatus.FinalizedWithError)
@@ -68,7 +69,7 @@ class _SessionWriter:
         self._locator = ""
         self._status = SessionStatus.Null
         self._topics: dict[str, TopicWriter] = {}
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     def _open(self) -> _core.SequenceWriter:
         raise NotImplementedError
@@ -205,6 +206,7 @@ class SequenceWriter(_SessionWriter):
         metadata: dict[str, Any],
         on_error: SessionLevelErrorPolicy,
     ) -> None:
+        _core.check_sequence_name(name)
         super().__init__(client, name, on_error)
         self._metadata = _metadata(metadata)
 
@@ -283,11 +285,17 @@ class TopicWriter:
     def dropped_record_count(self) -> int:
         return self._core.dropped_record_count
 
-    def push(self, message: Message) -> None:
-        if not isinstance(message, Message):
+    def push(self, message: Message | ReadMessage) -> None:
+        if isinstance(message, ReadMessage):
+            try:
+                data = message.get_data()
+            except Exception as e:
+                raise self._core.reject(f"cannot convert the message: {e}") from None
+        elif isinstance(message, Message):
+            data = message.data
+        else:
             kind = type(message)
-            raise self._core.reject(f"message must be a mosaicolabs.Message, not {kind.__module__}.{kind.__qualname__}")
-        data = message.data
+            raise self._core.reject(f"message must be a Message, not {kind.__module__}.{kind.__qualname__}")
         if not isinstance(data, self._ontology):
             raise self._core.reject(
                 f"message data is {type(data).__name__}, but topic '{self.name}' stores {self._ontology.__name__}"
@@ -299,6 +307,8 @@ class TopicWriter:
             self._core.push(self._kind, timestamp, data)
             return
         try:
+            if not isinstance(message, Message):
+                message = Message(timestamp_ns=timestamp, data=data)
             row = pa.RecordBatch.from_pylist([message._encode()], schema=self._schema)
         except Exception as e:
             raise self._core.reject(f"cannot convert the message: {e}") from None

@@ -23,6 +23,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<write::SequenceWriter>()?;
     m.add_class::<write::TopicWriter>()?;
     m.add_function(wrap_pyfunction!(write::topic_name, m)?)?;
+    m.add_function(wrap_pyfunction!(write::check_sequence_name, m)?)?;
     m.add_function(wrap_pyfunction!(write::check_user_metadata, m)?)?;
     m.add_function(wrap_pyfunction!(image::encode_png, m)?)?;
     m.add_function(wrap_pyfunction!(image::encode_png_batch, m)?)?;

@@ -182,7 +182,7 @@ impl SequenceWriter {
             }
             Closing::Interrupted(_, signal) | Closing::Abandoned(signal) => return Err(signal),
         };
-        Ok(TopicWriter::new(writer, self.interrupter.clone()))
+        Ok(TopicWriter::new(writer, self.interrupter.clone(), on_error))
     }
 
     fn finish(&self, py: Python<'_>) -> PyResult<Option<Py<PyBaseException>>> {
@@ -234,14 +234,20 @@ pub(crate) struct TopicWriter(
     ProcessBound<mosaico_core::TopicWriter>,
     SchemaLock<Option<Arc<KnownSchema>>>,
     Interrupter,
+    TopicLevelErrorPolicy,
 );
 
 impl TopicWriter {
-    fn new(writer: mosaico_core::TopicWriter, interrupter: Interrupter) -> Self {
+    fn new(
+        writer: mosaico_core::TopicWriter,
+        interrupter: Interrupter,
+        on_error: TopicLevelErrorPolicy,
+    ) -> Self {
         Self(
             ProcessBound::new(writer),
             SchemaLock::new(None),
             interrupter,
+            on_error,
         )
     }
 
@@ -335,6 +341,9 @@ impl TopicWriter {
     fn handle_error(&self, py: Python<'_>, reason: &str) -> PyResult<bool> {
         let writer = self.0.get()?;
         let _entered = enter(self.2.id())?;
+        if self.3 != TopicLevelErrorPolicy::Finalize {
+            return run(py, writer.handle_error(reason));
+        }
         match wait_closing(py, writer.handle_error(reason), &self.2)? {
             Closing::Done(result) => result.map_err(to_py),
             Closing::Interrupted(Err(error), signal) => Err(interrupted(py, signal, error, to_py)),
@@ -387,6 +396,11 @@ impl TopicWriter {
 #[pyfunction]
 pub(crate) fn topic_name(name: &str) -> String {
     mosaico_core::topic_name(name)
+}
+
+#[pyfunction]
+pub(crate) fn check_sequence_name(name: &str) -> PyResult<()> {
+    mosaico_core::check_sequence_name(name).map_err(to_py)
 }
 
 #[pyfunction]
