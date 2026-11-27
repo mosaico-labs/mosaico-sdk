@@ -24,3 +24,5 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 tower = { version = "0.5", features = ["util"] }
 mosaico-core = { path = "mosaico-core" }
 pyo3 = "0.30"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }

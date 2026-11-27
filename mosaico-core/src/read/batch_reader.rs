@@ -9,7 +9,7 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::comm::connection::Connection;
+use crate::comm::connection::{Connection, Lease};
 use crate::error::{Error, ErrorKind, Result};
 use crate::scope::Token;
 
@@ -29,13 +29,24 @@ impl BatchReader {
     ) -> Result<Self> {
         let data = connection.do_get(ticket).await?;
         let decoder = FlightDataDecoder::new(data.map(|item| item.map_err(FlightError::from)));
-        Self::start(decoder, token).await
+        Self::spawn(decoder, token, connection.lease()).await
     }
 
-    pub(crate) async fn start(mut decoder: FlightDataDecoder, token: Arc<Token>) -> Result<Self> {
+    #[cfg(test)]
+    pub(crate) async fn start(decoder: FlightDataDecoder, token: Arc<Token>) -> Result<Self> {
+        Self::spawn(decoder, token, None).await
+    }
+
+    async fn spawn(
+        mut decoder: FlightDataDecoder,
+        token: Arc<Token>,
+        lease: Option<Arc<Lease>>,
+    ) -> Result<Self> {
         let schema = read_schema(&mut decoder).await?;
         let (sender, batches) = mpsc::channel(PREFETCH);
+
         let task = tokio::spawn(async move {
+            let _lease = lease;
             token
                 .run_until_closed(forward_batches(decoder, sender))
                 .await;
@@ -68,17 +79,13 @@ impl BatchReader {
             Err(e) => Err(Error::new(ErrorKind::Stream, "batch reader cancelled").with_source(e)),
         }
     }
-
-    pub(crate) fn close(&mut self) {
-        if let Some(task) = self.task.take() {
-            task.abort();
-        }
-    }
 }
 
 impl Drop for BatchReader {
     fn drop(&mut self) {
-        self.close();
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -105,17 +112,24 @@ async fn forward_batches(
     mut decoder: FlightDataDecoder,
     sender: mpsc::Sender<Result<RecordBatch>>,
 ) {
-    while let Some(data) = decoder.next().await {
+    loop {
+        let Ok(permit) = sender.reserve().await else {
+            return;
+        };
+        let Some(data) = decoder.next().await else {
+            return;
+        };
         let item = match data.map(|d| d.payload) {
-            Ok(DecodedPayload::RecordBatch(batch)) => Ok(batch),
-            Ok(DecodedPayload::None) => continue,
+            Ok(DecodedPayload::RecordBatch(batch)) if batch.num_rows() > 0 => Ok(batch),
+            Ok(DecodedPayload::RecordBatch(_) | DecodedPayload::None) => continue,
             Ok(DecodedPayload::Schema(_)) => {
                 Err(Error::new(ErrorKind::Protocol, "schema changed mid-stream"))
             }
             Err(e) => Err(Error::from(e)),
         };
         let failed = item.is_err();
-        if sender.send(item).await.is_err() || failed {
+        permit.send(item);
+        if failed {
             return;
         }
     }
@@ -199,5 +213,105 @@ pub(crate) mod testing {
         let decoder = FlightDataDecoder::new(encoded.chain(tail));
         let reader = BatchReader::start(decoder, token.clone()).await.unwrap();
         TopicBatchStreamer::single(reader, info, token)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use arrow_array::{Int64Array, RecordBatch};
+    use arrow_flight::decode::FlightDataDecoder;
+    use arrow_flight::encode::FlightDataEncoderBuilder;
+    use arrow_schema::{DataType, Field, Schema};
+    use futures::stream::{self, StreamExt};
+
+    use super::BatchReader;
+    use crate::scope::Scope;
+
+    #[tokio::test]
+    async fn skips_empty_batches() {
+        let schema = Schema::new(vec![Field::new("timestamp_ns", DataType::Int64, false)]);
+        let batches: Vec<_> = [vec![], vec![1, 2], vec![], vec![3]]
+            .into_iter()
+            .map(|values| {
+                RecordBatch::try_new(
+                    Arc::new(schema.clone()),
+                    vec![Arc::new(Int64Array::from(values))],
+                )
+                .unwrap()
+            })
+            .collect();
+        let data = arrow_flight::utils::batches_to_flight_data(&schema, batches).unwrap();
+        assert_eq!(data.len(), 5);
+        let decoder = FlightDataDecoder::new(stream::iter(data.into_iter().map(Ok)));
+        let mut reader = BatchReader::start(decoder, Scope::root().token())
+            .await
+            .unwrap();
+        let mut rows = Vec::new();
+        while let Some(batch) = reader.next_batch().await.unwrap() {
+            rows.push(batch.num_rows());
+        }
+        assert_eq!(rows, [2, 1]);
+    }
+
+    #[tokio::test]
+    async fn close_frees_window() {
+        let connection = crate::comm::connection::Connection::offline(1 << 20);
+        let read = connection.reader().await;
+        assert_eq!(connection.main_committed(), 16 << 20);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "timestamp_ns",
+            DataType::Int64,
+            false,
+        )]));
+        let encoded = FlightDataEncoderBuilder::new()
+            .with_schema(schema)
+            .build(stream::empty())
+            .chain(stream::pending());
+        let token = Scope::root().token();
+        let reader =
+            BatchReader::spawn(FlightDataDecoder::new(encoded), token.clone(), read.lease())
+                .await
+                .unwrap();
+        drop(read);
+        assert_eq!(connection.main_committed(), 16 << 20);
+        token.close();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(connection.main_committed(), 0);
+        drop(reader);
+    }
+
+    #[tokio::test]
+    async fn reads_one_ahead() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "timestamp_ns",
+            DataType::Int64,
+            false,
+        )]));
+        let batches: Vec<_> = (0..5)
+            .map(|i| {
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![i]))])
+                    .map_err(Into::into)
+            })
+            .collect();
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let counter = pulled.clone();
+        let encoded = FlightDataEncoderBuilder::new()
+            .with_schema(schema)
+            .build(stream::iter(batches))
+            .inspect(move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+            });
+        let mut reader = BatchReader::start(FlightDataDecoder::new(encoded), Scope::root().token())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(pulled.load(Ordering::SeqCst), 2);
+        assert!(reader.next_batch().await.unwrap().is_some());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(pulled.load(Ordering::SeqCst), 3);
     }
 }

@@ -9,10 +9,15 @@ use crate::comm::connection::ServerInfo;
 const BUDGET_BYTES: usize = 512 << 20;
 const PRESSURE_RETRY: Duration = Duration::from_millis(10);
 pub(crate) const QUEUE_MESSAGES: usize = 4;
+const IPC_HEADROOM: usize = 64;
 
 pub(crate) fn limits(info: &ServerInfo) -> (usize, usize) {
     let limit = usize::try_from(info.max_batch_size_bytes()).unwrap_or(usize::MAX);
-    (limit, limit.clamp(1, u32::MAX as usize / QUEUE_MESSAGES))
+    (limit, target(limit))
+}
+
+pub(crate) fn target(limit: usize) -> usize {
+    (limit - limit / IPC_HEADROOM).clamp(1, u32::MAX as usize / QUEUE_MESSAGES)
 }
 
 pub(crate) struct WriteBudget {

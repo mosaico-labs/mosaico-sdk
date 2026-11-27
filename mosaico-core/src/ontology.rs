@@ -3,6 +3,9 @@ use arrow_schema::Fields;
 
 use crate::comm::proto;
 use crate::error::Result;
+use crate::time::Timestamp;
+
+pub(crate) const TIMESTAMP_COLUMN: &str = "timestamp_ns";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -21,6 +24,15 @@ impl Format {
             Self::Image => proto::core::Format::Image,
         };
         format as i32
+    }
+
+    pub(crate) fn from_proto(value: i32) -> Option<Self> {
+        match proto::core::Format::try_from(value).ok()? {
+            proto::core::Format::Default => Some(Self::Default),
+            proto::core::Format::Ragged => Some(Self::Ragged),
+            proto::core::Format::Image => Some(Self::Image),
+            proto::core::Format::Unspecified => None,
+        }
     }
 }
 
@@ -51,7 +63,7 @@ pub trait RecordBuilder<T>: Default + Send + 'static {
 
 #[non_exhaustive]
 pub struct Message<'a, T: Ontology + 'a> {
-    pub timestamp_ns: i64,
+    pub timestamp_ns: Timestamp,
     pub data: T::View<'a>,
 }
 

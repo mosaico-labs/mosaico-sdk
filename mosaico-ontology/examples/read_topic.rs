@@ -3,7 +3,7 @@ use std::process::ExitCode;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float64Type, Int64Type};
-use mosaico_core::{ConnectOptions, MosaicoClient};
+use mosaico_core::{ConnectOptions, MosaicoClient, Timestamp};
 use mosaico_ontology::Imu;
 
 #[tokio::main]
@@ -25,17 +25,17 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let Some(t0) = imu.timestamp_ns_min() else {
         return Err("no time range: topic empty or not finalized".into());
     };
-    let t1 = t0 + 60 * 1_000_000_000;
+    let t1 = Timestamp::from_ns(t0.as_ns() + 60 * 1_000_000_000);
 
     let mut kept = Vec::new();
-    let mut streamer = imu.get_data_streamer::<Imu>(Some(t0), Some(t1)).await?;
+    let mut streamer = imu.get_data_streamer::<Imu>(t0..t1).await?;
     while let Some(msg) = streamer.next().await? {
         if msg.data.acceleration()?.z()? > 15.0 {
             kept.push(msg.to_model()?);
         }
     }
 
-    let mut streamer = imu.get_batch_streamer(Some(t0), Some(t1)).await?;
+    let mut streamer = imu.get_batch_streamer(t0..t1).await?;
     while let Some(rb) = streamer.next_batch().await? {
         let ts = rb
             .column_by_name("timestamp_ns")
@@ -63,6 +63,6 @@ async fn run() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let _table = imu.to_arrow(Some(t0), Some(t1)).await?;
+    let _table = imu.to_arrow(t0..t1).await?;
     Ok(())
 }

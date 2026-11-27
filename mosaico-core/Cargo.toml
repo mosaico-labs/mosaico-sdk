@@ -21,6 +21,10 @@ futures.workspace = true
 http.workspace = true
 hyper-util.workspace = true
 tower.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util"] }
+h2 = "0.4"
+bytes = "1"

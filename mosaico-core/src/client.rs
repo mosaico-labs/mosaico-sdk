@@ -1,11 +1,10 @@
-use arrow_flight::Criteria;
-use prost::Message;
-
 use crate::comm::action::ActionKind;
 use crate::comm::connection::{ConnectOptions, Connection, ServerInfo};
 use crate::comm::proto;
-use crate::error::{Error, ErrorKind, Result};
+use crate::error::{ErrorKind, Result};
+use crate::listing::{self, PageStart, SequenceNames, SequenceOrder, SequencePage};
 use crate::locator::{self, sequence_name};
+use crate::metadata::UserMetadata;
 use crate::read::sequence::SequenceHandler;
 use crate::read::topic::TopicHandler;
 use crate::write::sequence::SequenceWriter;
@@ -49,7 +48,7 @@ impl MosaicoClient {
         Ok(Self { connection })
     }
 
-    pub fn server_info(&self) -> &ServerInfo {
+    pub fn info(&self) -> &ServerInfo {
         self.connection.info()
     }
 
@@ -72,7 +71,7 @@ impl MosaicoClient {
     pub async fn sequence_create(
         &self,
         sequence_name: &str,
-        metadata: Option<Vec<u8>>,
+        metadata: Option<&UserMetadata>,
         on_error: SessionLevelErrorPolicy,
     ) -> Result<SequenceWriter> {
         SequenceWriter::create(&self.connection, sequence_name, metadata, on_error).await
@@ -87,26 +86,24 @@ impl MosaicoClient {
     }
 
     pub async fn list_sequences(&self) -> Result<Vec<String>> {
-        let request = proto::flight::ListFlightsCmd {
-            limit: 0,
-            start: Some(proto::flight::list_flights_cmd::Start::OrderBy(
-                proto::flight::SequenceOrder::CreatedAt as i32,
-            )),
-        };
-        let criteria = Criteria {
-            expression: request.encode_to_vec().into(),
-        };
+        Ok(self
+            .list_sequences_page(0, SequenceOrder::CreatedAt)
+            .await?
+            .names)
+    }
+
+    pub async fn list_sequences_page(
+        &self,
+        limit: u32,
+        start: impl Into<PageStart>,
+    ) -> Result<SequencePage> {
+        let criteria = listing::criteria(limit, &start.into())?;
         let infos = self.connection.list_flights(criteria).await?;
-        infos
-            .into_iter()
-            .map(|info| {
-                info.flight_descriptor
-                    .and_then(|descriptor| descriptor.path.into_iter().next())
-                    .ok_or_else(|| {
-                        Error::new(ErrorKind::Protocol, "sequence listing without a name")
-                    })
-            })
-            .collect()
+        listing::page_from_infos(infos, limit)
+    }
+
+    pub fn iter_sequences(&self, page_size: u32, order_by: SequenceOrder) -> SequenceNames {
+        SequenceNames::new(self.clone(), page_size, order_by)
     }
 
     pub async fn sequence_delete(&self, sequence_name: &str) -> Result<()> {

@@ -298,3 +298,123 @@ impl<C> OptionalStruct<C> {
         Some(columns)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::{Int64Array, ListArray};
+    use arrow_buffer::{NullBuffer, OffsetBuffer};
+    use arrow_schema::{DataType, Field};
+    use mosaico_core::ErrorKind;
+
+    use super::*;
+
+    fn parent(columns: Vec<(&str, ArrayRef)>) -> StructArray {
+        let (fields, arrays): (Vec<_>, Vec<_>) = columns
+            .into_iter()
+            .map(|(name, array)| {
+                (
+                    Arc::new(Field::new(name, array.data_type().clone(), true)),
+                    array,
+                )
+            })
+            .unzip();
+        StructArray::new(fields.into(), arrays, None)
+    }
+
+    fn schema_error<T>(result: Result<T>, text: &str) {
+        let Err(error) = result else {
+            panic!("expected an error with {text}");
+        };
+        assert_eq!(error.kind(), ErrorKind::Schema);
+        assert!(error.to_string().contains(text), "{error}");
+    }
+
+    #[test]
+    fn required_null_and_missing() {
+        let values: ArrayRef = Arc::new(Float64Array::from(vec![Some(1.0), None]));
+        let a = parent(vec![("x", values)]);
+        let x = Required::<Float64Type>::new(&a, "acceleration", "x").unwrap();
+        assert_eq!(x.get(0).unwrap(), 1.0);
+        schema_error(x.get(1), "null in required field acceleration.x");
+        schema_error(
+            Required::<Float64Type>::new(&a, "acceleration", "y"),
+            "missing field acceleration.y",
+        );
+    }
+
+    #[test]
+    fn wrong_column_type() {
+        let ints: ArrayRef = Arc::new(Int64Array::from(vec![1]));
+        let a = parent(vec![("x", ints.clone()), ("s", ints)]);
+        schema_error(
+            Required::<Float64Type>::new(&a, "a", "x"),
+            "field a.x has an unexpected type",
+        );
+        schema_error(Optional::<Float64Type>::new(&a, "a", "x"), "a.x");
+        schema_error(RequiredString::new(&a, "", "s"), "field s");
+        schema_error(OptionalBool::new(&a, "", "x"), "field x");
+    }
+
+    #[test]
+    fn strings_and_views() {
+        let utf8: ArrayRef = Arc::new(StringArray::from(vec![Some("a"), None]));
+        let view: ArrayRef = Arc::new(StringViewArray::from(vec![Some("b"), None]));
+        let a = parent(vec![("u", utf8), ("v", view)]);
+        for (name, first) in [("u", "a"), ("v", "b")] {
+            let required = RequiredString::new(&a, "h", name).unwrap();
+            assert_eq!(required.get(0).unwrap(), first);
+            schema_error(required.get(1), "null in required field h.");
+            let optional = OptionalString::new(&a, "h", name).unwrap();
+            assert_eq!(optional.get(1), None);
+        }
+        assert_eq!(OptionalString::new(&a, "h", "w").unwrap().get(0), None);
+    }
+
+    #[test]
+    fn list_null_item() {
+        let values = Float64Array::from(vec![Some(1.0), Some(2.0), None, Some(4.0)]);
+        let field = Arc::new(Field::new("item", DataType::Float64, true));
+        let list = ListArray::new(
+            field,
+            OffsetBuffer::new(vec![0, 2, 4, 4].into()),
+            Arc::new(values),
+            Some(NullBuffer::from(vec![true, true, false])),
+        );
+        let a = parent(vec![("covariance", Arc::new(list.clone()))]);
+        let covariance = OptionalF64List::new(&a, "acceleration", "covariance").unwrap();
+        assert_eq!(covariance.get(0).unwrap(), Some(&[1.0, 2.0][..]));
+        schema_error(
+            covariance.get(1),
+            "null item in field acceleration.covariance",
+        );
+        assert_eq!(covariance.get(2).unwrap(), None);
+        let sliced = parent(vec![("covariance", Arc::new(list.slice(1, 2)))]);
+        let covariance = OptionalF64List::new(&sliced, "", "covariance").unwrap();
+        schema_error(covariance.get(0), "null item");
+        assert_eq!(covariance.get(1).unwrap(), None);
+    }
+
+    #[test]
+    fn struct_nulls() {
+        let inner = StructArray::new(
+            vec![Arc::new(Field::new("x", DataType::Float64, true))].into(),
+            vec![Arc::new(Float64Array::from(vec![1.0, 2.0]))],
+            Some(NullBuffer::from(vec![true, false])),
+        );
+        let a = parent(vec![("orientation", Arc::new(inner))]);
+        let required = RequiredStruct::new(&a, "", "orientation", |_, _| Ok(())).unwrap();
+        assert!(required.get(0).is_ok());
+        schema_error(required.get(1), "null in required field orientation");
+        let optional = OptionalStruct::new(&a, "", "orientation", |_, _| Ok(())).unwrap();
+        assert!(optional.get(0).is_some());
+        assert!(optional.get(1).is_none());
+        let missing = OptionalStruct::new(&a, "", "header", |_, _| Ok(())).unwrap();
+        assert!(missing.get(0).is_none());
+        schema_error(
+            RequiredStruct::new(&a, "", "acceleration", |_, _| Ok(())),
+            "missing field acceleration",
+        );
+    }
+}

@@ -54,11 +54,16 @@ impl Error {
 
     pub(crate) fn left_open_by(mut self, abort: &Error) -> Self {
         let text = self.to_string();
+        let stays = if abort.kind == ErrorKind::Closed {
+            "may stay open"
+        } else {
+            "stays open"
+        };
         let abort = abort.to_string();
         self.message = if abort == text {
-            format!("{text}; the session stays open on the server")
+            format!("{text}; the session {stays} on the server")
         } else {
-            format!("{text}; the session stays open on the server: {abort}")
+            format!("{text}; the session {stays} on the server: {abort}")
         };
         self.left_open = true;
         self
@@ -68,6 +73,13 @@ impl Error {
         if self.kind == ErrorKind::NotFound {
             self.message = message();
             self.source = None;
+        }
+        self
+    }
+
+    pub(crate) fn in_topic(mut self, locator: &str) -> Self {
+        if self.kind != ErrorKind::Closed {
+            self.message = format!("topic '{locator}': {}", self.message);
         }
         self
     }
