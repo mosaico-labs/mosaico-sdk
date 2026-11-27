@@ -1,42 +1,43 @@
-use std::any::Any;
-use std::sync::OnceLock;
+use std::any::{Any, TypeId};
+use std::sync::{Arc, OnceLock};
 
 use arrow_array::{Int64Array, RecordBatch};
+use arrow_schema::SchemaRef;
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::ontology::Ontology;
-use crate::read::data_streamer::timestamps;
-use crate::read::merge_reader::{MergeReader, WINDOW_ROWS};
-use crate::read::streamer::{ReadInfo, TopicBatchStreamer};
+use crate::read::merge_reader::{MergeReader, MergeWindow};
+use crate::read::streamer::{CloseHandle, ReadInfo, TopicBatchStreamer};
 use crate::read::topic::TopicHandler;
+use crate::scope::Token;
+use crate::time::Timestamp;
 
 type Columns = Box<dyn Any + Send + Sync>;
+
+enum Cached {
+    Ready(TypeId, Columns),
+    Failed(TypeId, ErrorKind, String),
+}
 
 struct Current {
     batch: RecordBatch,
     timestamps: Int64Array,
     row: usize,
-    columns: OnceLock<Columns>,
+    columns: OnceLock<Cached>,
 }
 
-pub struct SequenceDataStreamer {
+pub struct SequenceWindowStreamer {
     topics: Vec<TopicHandler>,
     reader: MergeReader,
-    current: Vec<Option<Current>>,
-    order: Vec<u16>,
-    position: usize,
     info: ReadInfo,
 }
 
-impl SequenceDataStreamer {
-    pub(crate) fn new(topics: Vec<TopicHandler>, streams: Vec<TopicBatchStreamer>) -> Result<Self> {
-        Self::with_window(topics, streams, WINDOW_ROWS)
-    }
-
-    fn with_window(
+impl SequenceWindowStreamer {
+    pub(crate) fn new(
         topics: Vec<TopicHandler>,
         streams: Vec<TopicBatchStreamer>,
         window_rows: usize,
+        token: Arc<Token>,
     ) -> Result<Self> {
         let infos: Vec<ReadInfo> = streams.iter().map(|s| s.info()).collect();
         let info = ReadInfo {
@@ -44,13 +45,10 @@ impl SequenceDataStreamer {
             timestamp_ns_min: infos.iter().filter_map(|i| i.timestamp_ns_min).min(),
             timestamp_ns_max: infos.iter().filter_map(|i| i.timestamp_ns_max).max(),
         };
-        let current = topics.iter().map(|_| None).collect();
+        let labels = topics.iter().map(|t| t.locator()).collect();
         Ok(Self {
+            reader: MergeReader::with_token(streams, window_rows, token)?.labeled(labels),
             topics,
-            reader: MergeReader::new(streams, window_rows)?,
-            current,
-            order: Vec::new(),
-            position: 0,
             info,
         })
     }
@@ -59,16 +57,94 @@ impl SequenceDataStreamer {
         &self.topics
     }
 
+    pub fn schemas(&self) -> Vec<SchemaRef> {
+        self.reader.schemas()
+    }
+
+    pub fn close_handles(&self) -> Vec<CloseHandle> {
+        self.reader.close_handles()
+    }
+
     pub fn msg_count(&self) -> u64 {
         self.info.msg_count
     }
 
-    pub fn timestamp_ns_min(&self) -> Option<i64> {
+    pub fn timestamp_ns_min(&self) -> Option<Timestamp> {
         self.info.timestamp_ns_min
     }
 
-    pub fn timestamp_ns_max(&self) -> Option<i64> {
+    pub fn timestamp_ns_max(&self) -> Option<Timestamp> {
         self.info.timestamp_ns_max
+    }
+
+    pub async fn next_window(&mut self) -> Result<Option<MergeWindow>> {
+        self.reader.next_window().await
+    }
+
+    pub fn close(&mut self) {
+        self.reader.close();
+    }
+
+    fn ensure_open(&mut self) -> Result<()> {
+        self.reader.ensure_open()
+    }
+}
+
+pub struct SequenceDataStreamer {
+    windows: SequenceWindowStreamer,
+    current: Vec<Option<Current>>,
+    order: Vec<u16>,
+    position: usize,
+}
+
+impl SequenceDataStreamer {
+    #[cfg(test)]
+    pub(crate) fn new(topics: Vec<TopicHandler>, streams: Vec<TopicBatchStreamer>) -> Result<Self> {
+        Self::with_window(topics, streams, crate::read::merge_reader::WINDOW_ROWS)
+    }
+
+    #[cfg(test)]
+    fn with_window(
+        topics: Vec<TopicHandler>,
+        streams: Vec<TopicBatchStreamer>,
+        window_rows: usize,
+    ) -> Result<Self> {
+        Ok(Self::from_windows(SequenceWindowStreamer::new(
+            topics,
+            streams,
+            window_rows,
+            crate::scope::Scope::root().token(),
+        )?))
+    }
+
+    pub(crate) fn from_windows(windows: SequenceWindowStreamer) -> Self {
+        let current = windows.topics.iter().map(|_| None).collect();
+        Self {
+            windows,
+            current,
+            order: Vec::new(),
+            position: 0,
+        }
+    }
+
+    pub fn topics(&self) -> &[TopicHandler] {
+        self.windows.topics()
+    }
+
+    pub fn msg_count(&self) -> u64 {
+        self.windows.msg_count()
+    }
+
+    pub fn timestamp_ns_min(&self) -> Option<Timestamp> {
+        self.windows.timestamp_ns_min()
+    }
+
+    pub fn timestamp_ns_max(&self) -> Option<Timestamp> {
+        self.windows.timestamp_ns_max()
+    }
+
+    pub fn close_handles(&self) -> Vec<CloseHandle> {
+        self.windows.close_handles()
     }
 
     pub async fn next(&mut self) -> Result<Option<RowRef<'_>>> {
@@ -79,47 +155,50 @@ impl SequenceDataStreamer {
         self.position += 1;
         if self.current[topic].is_none() {
             self.close();
-            return Err(Error::new(ErrorKind::Protocol, "merge row without a batch"));
+            return Err(no_batch());
         }
         let Some(current) = self.current[topic].as_mut() else {
-            return Ok(None);
+            return Err(no_batch());
         };
         let row = current.row;
         current.row += 1;
         let current = &*current;
         Ok(Some(RowRef {
-            timestamp_ns: current.timestamps.value(row),
-            topic: &self.topics[topic],
+            timestamp_ns: Timestamp::from_ns(current.timestamps.value(row)),
+            topic: &self.windows.topics[topic],
             current,
             row,
         }))
     }
 
-    pub async fn next_timestamp(&mut self) -> Result<Option<i64>> {
+    pub async fn next_timestamp(&mut self) -> Result<Option<Timestamp>> {
         if !self.ready().await? {
             return Ok(None);
         }
         let topic = usize::from(self.order[self.position]);
         match self.current[topic].as_ref() {
-            Some(c) => Ok(Some(c.timestamps.value(c.row))),
+            Some(c) => Ok(Some(Timestamp::from_ns(c.timestamps.value(c.row)))),
             None => {
                 self.close();
-                Err(Error::new(ErrorKind::Protocol, "merge row without a batch"))
+                Err(no_batch())
             }
         }
     }
 
     pub fn close(&mut self) {
-        self.reader.close();
+        self.windows.close();
         self.clear();
     }
 
     async fn ready(&mut self) -> Result<bool> {
-        self.reader.ensure_open()?;
+        if let Err(e) = self.windows.ensure_open() {
+            self.clear();
+            return Err(e);
+        }
         if self.position < self.order.len() {
             return Ok(true);
         }
-        let window = match self.reader.next_window().await {
+        let window = match self.windows.next_window().await {
             Ok(Some(window)) => window,
             Ok(None) => {
                 self.clear();
@@ -130,10 +209,10 @@ impl SequenceDataStreamer {
                 return Err(e);
             }
         };
-        for (topic, batch) in window.batches {
-            self.current[usize::from(topic)] = Some(Current {
-                timestamps: timestamps(&batch)?,
-                batch,
+        for b in window.batches {
+            self.current[usize::from(b.topic)] = Some(Current {
+                timestamps: b.timestamps,
+                batch: b.batch,
                 row: 0,
                 columns: OnceLock::new(),
             });
@@ -151,7 +230,7 @@ impl SequenceDataStreamer {
 }
 
 pub struct RowRef<'a> {
-    pub timestamp_ns: i64,
+    pub timestamp_ns: Timestamp,
     topic: &'a TopicHandler,
     current: &'a Current,
     row: usize,
@@ -175,14 +254,21 @@ impl<'a> RowRef<'a> {
             return Ok(None);
         }
         let current: &'a Current = self.current;
-        let columns = match current.columns.get() {
-            Some(columns) => columns,
-            None => {
-                let columns: Columns = Box::new(T::columns(&current.batch)?);
-                current.columns.get_or_init(|| columns)
+        let id = TypeId::of::<T>();
+        let cached = current
+            .columns
+            .get_or_init(|| match T::columns(&current.batch) {
+                Ok(columns) => Cached::Ready(id, Box::new(columns)),
+                Err(e) => Cached::Failed(id, e.kind(), e.to_string()),
+            });
+        let columns = match cached {
+            Cached::Ready(ready, columns) if *ready == id => columns.downcast_ref::<T::Columns>(),
+            Cached::Failed(failed, kind, message) if *failed == id => {
+                return Err(Error::new(*kind, message.clone()));
             }
+            _ => None,
         };
-        let columns = columns.downcast_ref::<T::Columns>().ok_or_else(|| {
+        let columns = columns.ok_or_else(|| {
             Error::new(
                 ErrorKind::InvalidArgument,
                 format!(
@@ -194,6 +280,10 @@ impl<'a> RowRef<'a> {
         })?;
         Ok(Some(T::view(columns, self.row)))
     }
+}
+
+fn no_batch() -> Error {
+    Error::new(ErrorKind::Protocol, "merge row without a batch")
 }
 
 #[cfg(test)]
@@ -230,6 +320,26 @@ mod tests {
 
         fn from_view(_: &i64) -> Result<Self> {
             Ok(Value)
+        }
+    }
+
+    struct Same;
+
+    impl Ontology for Same {
+        const TAG: &'static str = "Value";
+        type Columns = Int64Array;
+        type View<'a> = i64;
+
+        fn columns(batch: &RecordBatch) -> Result<Int64Array> {
+            Value::columns(batch)
+        }
+
+        fn view(columns: &Int64Array, row: usize) -> i64 {
+            columns.value(row)
+        }
+
+        fn from_view(_: &i64) -> Result<Self> {
+            Ok(Same)
         }
     }
 
@@ -306,7 +416,11 @@ mod tests {
         let mut out = Vec::new();
         while let Some(row) = streamer.next().await.unwrap() {
             let value = row.view::<Value>().unwrap();
-            out.push((row.topic().name().to_owned(), row.timestamp_ns, value));
+            out.push((
+                row.topic().name().to_owned(),
+                row.timestamp_ns.as_ns(),
+                value,
+            ));
         }
         out
     }
@@ -356,6 +470,8 @@ mod tests {
         assert_eq!(row.view::<Value>().unwrap(), Some(10));
         let error = row.view::<Twin>().unwrap_err();
         assert_eq!(error.kind(), ErrorKind::InvalidArgument);
+        let error = row.view::<Same>().unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidArgument);
     }
 
     #[tokio::test]
@@ -381,8 +497,44 @@ mod tests {
         .await;
         let mut streamer = SequenceDataStreamer::new(vec![handler], vec![stream]).unwrap();
         let row = streamer.next().await.unwrap().unwrap();
-        assert_eq!(row.timestamp_ns, 1);
-        assert_eq!(row.view::<Value>().unwrap_err().kind(), ErrorKind::Schema);
+        assert_eq!(row.timestamp_ns, Timestamp::from_ns(1));
+        let first = row.view::<Value>().unwrap_err();
+        let again = row.view::<Value>().unwrap_err();
+        assert_eq!(first.kind(), ErrorKind::Schema);
+        assert_eq!(again.kind(), ErrorKind::Schema);
+        assert_eq!(first.to_string(), again.to_string());
+        assert_eq!(
+            row.view::<Twin>().unwrap_err().kind(),
+            ErrorKind::InvalidArgument
+        );
+        assert_eq!(
+            row.view::<Same>().unwrap_err().kind(),
+            ErrorKind::InvalidArgument
+        );
+    }
+
+    #[tokio::test]
+    async fn handles_wake_next() {
+        let connection = Connection::offline(1 << 20);
+        let scope = Scope::root();
+        let handler = TopicHandler::offline(&connection, scope.child(), "seq", "/a", "Value");
+        let slow = delayed(
+            schema(),
+            vec![batch(&[1])],
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+        let mut streamer = SequenceDataStreamer::new(vec![handler], vec![slow]).unwrap();
+        let handles = streamer.close_handles();
+        let waiting = tokio::spawn(async move { streamer.next().await.map(|r| r.is_some()) });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!waiting.is_finished());
+        handles[0].close();
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ended.unwrap_err().kind(), ErrorKind::Closed);
     }
 
     #[tokio::test]
@@ -395,11 +547,12 @@ mod tests {
             8,
         )
         .await;
-        assert_eq!(streamer.next_timestamp().await.unwrap(), Some(1));
-        assert_eq!(streamer.next_timestamp().await.unwrap(), Some(1));
-        assert_eq!(streamer.next().await.unwrap().unwrap().timestamp_ns, 1);
-        assert_eq!(streamer.next_timestamp().await.unwrap(), Some(3));
-        assert_eq!(streamer.next().await.unwrap().unwrap().timestamp_ns, 3);
+        let ts = Timestamp::from_ns;
+        assert_eq!(streamer.next_timestamp().await.unwrap(), Some(ts(1)));
+        assert_eq!(streamer.next_timestamp().await.unwrap(), Some(ts(1)));
+        assert_eq!(streamer.next().await.unwrap().unwrap().timestamp_ns, ts(1));
+        assert_eq!(streamer.next_timestamp().await.unwrap(), Some(ts(3)));
+        assert_eq!(streamer.next().await.unwrap().unwrap().timestamp_ns, ts(3));
         assert_eq!(streamer.next_timestamp().await.unwrap(), None);
     }
 
@@ -408,20 +561,20 @@ mod tests {
         let mut a = topic("/a", "Value", vec![&[5]]);
         a.info = ReadInfo {
             msg_count: 3,
-            timestamp_ns_min: Some(5),
-            timestamp_ns_max: Some(9),
+            timestamp_ns_min: Some(Timestamp::from_ns(5)),
+            timestamp_ns_max: Some(Timestamp::from_ns(9)),
         };
         let mut b = topic("/b", "Value", vec![&[2]]);
         b.info = ReadInfo {
             msg_count: 4,
-            timestamp_ns_min: Some(2),
-            timestamp_ns_max: Some(6),
+            timestamp_ns_min: Some(Timestamp::from_ns(2)),
+            timestamp_ns_max: Some(Timestamp::from_ns(6)),
         };
         let empty = topic("/c", "Value", vec![]);
         let (streamer, _scope) = open(vec![a, b, empty], 8).await;
         assert_eq!(streamer.msg_count(), 7);
-        assert_eq!(streamer.timestamp_ns_min(), Some(2));
-        assert_eq!(streamer.timestamp_ns_max(), Some(9));
+        assert_eq!(streamer.timestamp_ns_min(), Some(Timestamp::from_ns(2)));
+        assert_eq!(streamer.timestamp_ns_max(), Some(Timestamp::from_ns(9)));
         assert_eq!(streamer.topics().len(), 3);
     }
 

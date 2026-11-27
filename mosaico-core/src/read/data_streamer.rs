@@ -3,10 +3,9 @@ use arrow_array::types::Int64Type;
 use arrow_array::{Array, Int64Array, RecordBatch};
 
 use crate::error::{Error, Result};
-use crate::ontology::{Message, Ontology};
-use crate::read::streamer::TopicBatchStreamer;
-
-pub(crate) const TIMESTAMP_COLUMN: &str = "timestamp_ns";
+use crate::ontology::{Message, Ontology, TIMESTAMP_COLUMN};
+use crate::read::streamer::{CloseHandle, TopicBatchStreamer};
+use crate::time::Timestamp;
 
 struct Current<T: Ontology> {
     timestamps: Int64Array,
@@ -32,16 +31,11 @@ impl<T: Ontology> TopicDataStreamer<T> {
 
     pub async fn next(&mut self) -> Result<Option<Message<'_, T>>> {
         self.batches.ensure_open()?;
-        loop {
-            if self
-                .current
-                .as_ref()
-                .is_some_and(|c| c.row < c.timestamps.len())
-            {
-                break;
+        let current = loop {
+            if let Some(current) = self.current.take().filter(|c| c.row < c.timestamps.len()) {
+                break self.current.insert(current);
             }
             let Some(batch) = self.batches.next_batch().await? else {
-                self.current = None;
                 return Ok(None);
             };
             match read_batch::<T>(&batch) {
@@ -51,14 +45,11 @@ impl<T: Ontology> TopicDataStreamer<T> {
                     return Err(e);
                 }
             }
-        }
-        let Some(current) = self.current.as_mut() else {
-            return Ok(None);
         };
         let row = current.row;
         current.row += 1;
         Ok(Some(Message {
-            timestamp_ns: current.timestamps.value(row),
+            timestamp_ns: Timestamp::from_ns(current.timestamps.value(row)),
             data: T::view(&current.columns, row),
         }))
     }
@@ -67,12 +58,16 @@ impl<T: Ontology> TopicDataStreamer<T> {
         self.batches.msg_count()
     }
 
-    pub fn timestamp_ns_min(&self) -> Option<i64> {
+    pub fn timestamp_ns_min(&self) -> Option<Timestamp> {
         self.batches.timestamp_ns_min()
     }
 
-    pub fn timestamp_ns_max(&self) -> Option<i64> {
+    pub fn timestamp_ns_max(&self) -> Option<Timestamp> {
         self.batches.timestamp_ns_max()
+    }
+
+    pub fn close_handle(&self) -> CloseHandle {
+        self.batches.close_handle()
     }
 
     pub fn close(&mut self) {
@@ -159,7 +154,7 @@ mod tests {
         let mut stream = TopicDataStreamer::<Value>::new(source).unwrap();
         let mut rows = Vec::new();
         while let Some(msg) = stream.next().await.unwrap() {
-            rows.push((msg.timestamp_ns, msg.data));
+            rows.push((msg.timestamp_ns.as_ns(), msg.data));
         }
         assert_eq!(rows, vec![(1, 10), (2, 20), (3, 30)]);
         assert!(stream.next().await.unwrap().is_none());
@@ -178,12 +173,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_wakes_next() {
+        let source = streamer(schema(false), Vec::new(), Tail::Hang).await;
+        let mut stream = TopicDataStreamer::<Value>::new(source).unwrap();
+        let handle = stream.close_handle();
+        let waiting = tokio::spawn(async move { stream.next().await.map(|m| m.is_some()) });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!waiting.is_finished());
+        handle.close();
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ended.unwrap_err().kind(), ErrorKind::Closed);
+    }
+
+    #[tokio::test]
     async fn null_timestamp_closes() {
         let schema = schema(true);
         let batches = vec![batch(&schema, vec![Some(1)]), batch(&schema, vec![None])];
         let source = streamer(schema, batches, Tail::End).await;
         let mut stream = TopicDataStreamer::<Value>::new(source).unwrap();
-        assert_eq!(stream.next().await.unwrap().unwrap().timestamp_ns, 1);
+        assert_eq!(
+            stream.next().await.unwrap().unwrap().timestamp_ns,
+            Timestamp::from_ns(1)
+        );
         let failed = stream.next().await.err().unwrap();
         assert_eq!(failed.kind(), ErrorKind::Schema);
         let closed = stream.next().await.err().unwrap();
